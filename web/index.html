@@ -1,0 +1,700 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Điều khiển tay máy</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font-family: Inter, "Segoe UI", sans-serif;
+      background: #10151c;
+      color: #e8edf5;
+      font-synthesis: none;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      max-width: 960px;
+      margin: 0 auto;
+      padding: 32px 20px;
+    }
+
+    h1 { margin: 0 0 8px; font-size: 1.8rem; }
+    p { color: #94a9c5; line-height: 1.55; }
+
+    .topbar, .actions, .reading {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+
+    .layout {
+      display: grid;
+      grid-template-columns: minmax(0, 1.3fr) minmax(260px, 0.7fr);
+      gap: 18px;
+      margin-top: 22px;
+    }
+
+    .card {
+      padding: 22px;
+      border: 1px solid #293442;
+      border-radius: 14px;
+      background: #171e27;
+    }
+
+    .connection { display: flex; align-items: center; gap: 12px; }
+    .status { color: #a9b5c5; font-size: .92rem; }
+    .status[data-kind="ok"] { color: #67d6a2; }
+    .status[data-kind="error"] { color: #ff8c8c; }
+
+    .control { margin-top: 23px; }
+    .control:first-child { margin-top: 0; }
+    .control-heading { display: flex; justify-content: space-between; margin-bottom: 9px; }
+    .value { color: #91c8ff; font-variant-numeric: tabular-nums; }
+    input[type="range"] { width: 100%; accent-color: #5ba9f5; }
+    .range-note { min-height: 1.3em; margin-top: 6px; color: #a9b5c5; font-size: .82rem; }
+
+    button {
+      border: 0;
+      border-radius: 9px;
+      padding: 10px 15px;
+      background: #2f8de4;
+      color: white;
+      font: inherit;
+      font-weight: 650;
+      cursor: pointer;
+    }
+
+    button.secondary { border: 1px solid #39495a; background: #222d39; }
+    button.stop { background: #a64242; }
+    button:disabled { opacity: .45; cursor: not-allowed; }
+    .actions { justify-content: flex-start; margin-top: 24px; }
+
+    .readings {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 10px;
+      margin-top: 16px;
+    }
+
+    .reading {
+      align-items: flex-start;
+      flex-direction: column;
+      gap: 8px;
+      padding: 13px;
+      border-radius: 10px;
+      background: #111820;
+    }
+
+    .reading span { color: #9eacbc; font-size: .85rem; }
+    .reading strong { font-size: 1.2rem; font-variant-numeric: tabular-nums; }
+    .hint { margin: 15px 0 0; font-size: .84rem; }
+    .unsupported { display: none; margin-top: 18px; color: #ffb36b; }
+
+    @media (max-width: 700px) {
+      body { padding: 22px 14px; }
+      .layout { grid-template-columns: 1fr; }
+      .topbar { align-items: flex-start; flex-direction: column; }
+    }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <h1>Điều khiển tay máy</h1>
+      <p>Điều khiển góc servo/step qua USB-UART và xem tọa độ đầu tay theo động học thuận.</p>
+    </div>
+    <div class="connection">
+      <span id="status" class="status" data-kind="idle">Chưa kết nối</span>
+      <button id="connectButton">Kết nối UART</button>
+    </div>
+  </header>
+
+  <div id="unsupported" class="unsupported">
+    Trình duyệt này không hỗ trợ Web Serial. Hãy mở trang bằng Chrome hoặc Edge trên máy tính,
+    qua localhost hoặc HTTPS.
+  </div>
+
+  <main class="layout">
+    <section class="card" aria-labelledby="jointTitle">
+      <h2 id="jointTitle">Góc khớp</h2>
+
+      <div class="control">
+        <div class="control-heading">
+          <label for="servo1">Servo 1</label>
+          <span class="value"><output id="servo1Value">60</output>°</span>
+        </div>
+        <input id="servo1" type="range" min="0" max="90" step="1" value="60" disabled>
+        <div class="range-note">Giới hạn cơ khí: 0°–90°</div>
+      </div>
+
+      <div class="control">
+        <div class="control-heading">
+          <label for="servo2">Servo 2</label>
+          <span class="value"><output id="servo2Value">120</output>°</span>
+        </div>
+        <input id="servo2" type="range" min="90" max="180" step="1" value="120" disabled>
+        <div id="servo2Limit" class="range-note">Giới hạn: 90°–180°</div>
+      </div>
+
+      <div class="control">
+        <div class="control-heading">
+          <label for="stepAngle">Trục xoay (step)</label>
+          <span class="value"><output id="stepValue">180</output>°</span>
+        </div>
+        <input id="stepAngle" type="range" min="60" max="300" step="0.1" value="180" disabled>
+        <div class="range-note">Giới hạn: 60°–300°, phản hồi AS5600 xử lý nội bộ</div>
+      </div>
+
+      <div id="jointCondition" class="range-note"></div>
+      <div class="actions">
+        <button id="stopButton" class="stop" disabled>Dừng robot</button>
+      </div>
+      <p class="hint">Góc được tự động gửi khi kéo thanh điều khiển.</p>
+      <p class="hint">
+        Giới hạn bổ sung: servo 1 dưới 30° thì servo 2 từ 90° đến servo 1 + 150°;
+        servo 1 từ 30°–60° thì servo 2 tự do trong khoảng 90°–180°;
+        servo 1 trên 60° thì servo 2 từ servo 1 + 30° đến 180°.
+      </p>
+    </section>
+
+    <section class="card" aria-labelledby="positionTitle">
+      <h2 id="positionTitle">Vị trí đầu tay</h2>
+      <div class="readings">
+        <div class="reading"><span>X (mm)</span><strong id="xValue">—</strong></div>
+        <div class="reading"><span>Y (mm)</span><strong id="yValue">—</strong></div>
+        <div class="reading"><span>Z (mm)</span><strong id="zValue">—</strong></div>
+      </div>
+      <p class="hint">Tọa độ được firmware tính bằng FK. Góc step phản hồi AS5600 chỉ được dùng nội bộ, không gửi lên web.</p>
+      <h2>Nội suy hai điểm</h2>
+      <div class="actions">
+        <button id="savePointA" class="secondary" disabled>Lưu vị trí hiện tại A</button>
+        <button id="savePointB" class="secondary" disabled>Lưu vị trí hiện tại B</button>
+      </div>
+      <p id="pointAValue" class="hint">Điểm A: chưa lưu</p>
+      <p id="pointBValue" class="hint">Điểm B: chưa lưu</p>
+      <div class="actions">
+        <button id="playTrajectory" disabled>Chạy thử A → B</button>
+      </div>
+      <p id="trajectoryStatus" class="hint">Firmware chia đường Cartesian A→B thành 1000 đoạn (1001 điểm gồm hai đầu), tính IK tối đa 4 điểm mỗi vòng loop và lưu cache. Khi chạy, robot phát lại cache; khớp lệch nhiều nhất đi tối đa 0,9° mỗi vòng loop. Nếu bấm chạy lại cùng A/B, cache được tái sử dụng trong RAM.</p>
+    </section>
+  </main>
+
+  <script>
+    const statusLabel = document.querySelector("#status");
+    const connectButton = document.querySelector("#connectButton");
+    const stopButton = document.querySelector("#stopButton");
+    const savePointAButton = document.querySelector("#savePointA");
+    const savePointBButton = document.querySelector("#savePointB");
+    const playTrajectoryButton = document.querySelector("#playTrajectory");
+    const servo1 = document.querySelector("#servo1");
+    const servo2 = document.querySelector("#servo2");
+    const stepAngle = document.querySelector("#stepAngle");
+    const controls = [servo1, servo2, stepAngle];
+    let port = null;
+    let reader = null;
+    let writer = null;
+    let receiveBuffer = new Uint8Array(0);
+    let controlsDirty = false;
+    let pendingSetCommand = false;
+    let setCommandTimer = null;
+    let lastSetCommandAt = 0;
+    let currentPosition = null;
+    let pointA = null;
+    let pointB = null;
+    let trajectoryRunning = false;
+    const minimumSetCommandIntervalMs = 50;
+    const pointAStorageKey = "armRobotPointA";
+    const pointBStorageKey = "armRobotPointB";
+    const packetLength = 30;
+    const packetMagic = [0x52, 0x42];
+    const protocolVersion = 1;
+    const packetTypes = { state: 1, ack: 2, error: 3 };
+    const commandTypes = {
+      getState: 16,
+      setJoints: 17,
+      playTrajectory: 18,
+      stop: 19
+    };
+    const protocolErrors = {
+      1: "Lệnh bị từ chối: robot đang chạy hoặc chuẩn bị quỹ đạo",
+      2: "Stepper chưa khởi tạo vị trí",
+      3: "Điểm A ngoài tầm với hoặc vi phạm giới hạn khớp",
+      4: "Đường đi tới A vượt giới hạn khớp",
+      5: "Lệnh UART không hợp lệ",
+      6: "Hãy dừng quỹ đạo trước khi điều khiển góc",
+      7: "Góc nằm ngoài giới hạn",
+      8: "Hai góc servo vi phạm điều kiện khớp",
+      9: "Feedback stepper chưa sẵn sàng",
+      10: "Lệnh UART quá dài",
+      11: "Quỹ đạo có điểm ngoài tầm với",
+      12: "Quỹ đạo vi phạm giới hạn khớp",
+      13: "Mất tín hiệu AS5600 hoặc góc nằm ngoài giới hạn",
+      14: "Góc đích không hợp lệ, chuyển động đã dừng",
+      15: "Tọa độ quỹ đạo không hợp lệ",
+      16: "Lệnh nhị phân không xác định",
+      17: "Góc khớp không hợp lệ"
+    };
+
+    if (!("serial" in navigator)) {
+      document.querySelector("#unsupported").style.display = "block";
+      connectButton.disabled = true;
+    }
+
+    function setStatus(message, kind = "idle") {
+      statusLabel.textContent = message;
+      statusLabel.dataset.kind = kind;
+    }
+
+    function loadSavedPoint(storageKey, labelId, name) {
+      try {
+        const serialized = localStorage.getItem(storageKey);
+        if (!serialized) return null;
+        const point = JSON.parse(serialized);
+        if (![point.x, point.y, point.z].every(Number.isFinite)) {
+          throw new Error("tọa độ lưu không hợp lệ");
+        }
+        document.querySelector(`#${labelId}`).textContent =
+          `Điểm ${name}: ${formatPoint(point)}`;
+        return point;
+      } catch (error) {
+        setStatus(`Không đọc được điểm ${name}: ${error.message}`, "error");
+        return null;
+      }
+    }
+
+    function updateJointLimits() {
+      const firstAngle = Number(servo1.value);
+      let minimum;
+      let maximum;
+      if (firstAngle < 30) {
+        minimum = 90;
+        maximum = firstAngle + 150;
+      } else if (firstAngle <= 60) {
+        minimum = 90;
+        maximum = 180;
+      } else {
+        minimum = firstAngle + 30;
+        maximum = 180;
+      }
+
+      const servo2Limit = document.querySelector("#servo2Limit");
+      const condition = document.querySelector("#jointCondition");
+      servo2.min = String(minimum);
+      servo2.max = String(maximum);
+      if (Number(servo2.value) < minimum) servo2.value = String(minimum);
+      if (Number(servo2.value) > maximum) servo2.value = String(maximum);
+      servo2Limit.textContent = `Giới hạn theo servo 1 hiện tại: ${minimum}°–${maximum}°`;
+      condition.textContent = "";
+    }
+
+    function updateLabels() {
+      updateJointLimits();
+      document.querySelector("#servo1Value").value = Number(servo1.value).toFixed(0);
+      document.querySelector("#servo2Value").value = Number(servo2.value).toFixed(0);
+      document.querySelector("#stepValue").value = Number(stepAngle.value).toFixed(1);
+    }
+
+    function updateTrajectoryButtons() {
+      const canSave = Boolean(writer && currentPosition && !trajectoryRunning);
+      savePointAButton.disabled = !canSave;
+      savePointBButton.disabled = !canSave;
+      playTrajectoryButton.disabled =
+        !writer || !pointA || !pointB || trajectoryRunning;
+    }
+
+    function formatPoint(point) {
+      return `X ${point.x.toFixed(1)}, Y ${point.y.toFixed(1)}, Z ${point.z.toFixed(1)} mm`;
+    }
+
+    function saveCurrentPoint(name) {
+      if (!currentPosition || trajectoryRunning) return;
+      const point = { ...currentPosition };
+      if (name === "A") {
+        pointA = point;
+        document.querySelector("#pointAValue").textContent =
+          `Điểm A: ${formatPoint(point)}`;
+        try {
+          localStorage.setItem(pointAStorageKey, JSON.stringify(point));
+        } catch (error) {
+          setStatus(`Không lưu được điểm A vào trình duyệt: ${error.message}`, "error");
+        }
+      } else {
+        pointB = point;
+        document.querySelector("#pointBValue").textContent =
+          `Điểm B: ${formatPoint(point)}`;
+        try {
+          localStorage.setItem(pointBStorageKey, JSON.stringify(point));
+        } catch (error) {
+          setStatus(`Không lưu được điểm B vào trình duyệt: ${error.message}`, "error");
+        }
+      }
+      updateTrajectoryButtons();
+    }
+
+    function displayNumber(id, value, decimals = 2) {
+      document.querySelector(`#${id}`).textContent =
+        typeof value === "number" && Number.isFinite(value)
+          ? value.toFixed(decimals)
+          : "—";
+    }
+
+    function handleMessage(data) {
+      if (data.type === "state") {
+        displayNumber("xValue", data.x);
+        displayNumber("yValue", data.y);
+        displayNumber("zValue", data.z);
+        if (Number.isFinite(data.x) && Number.isFinite(data.y) &&
+            Number.isFinite(data.z)) {
+          currentPosition = { x: data.x, y: data.y, z: data.z };
+        }
+        const wasPreparing = trajectoryRunning;
+        trajectoryRunning =
+          data.trajectory === true || data.preparing === true;
+        if (trajectoryRunning) controlsDirty = false;
+        controls.forEach(control => {
+          control.disabled = !writer || trajectoryRunning;
+        });
+        updateTrajectoryButtons();
+        if (data.preparing === true) {
+          const progress = Number.isFinite(data.cacheProgress)
+            ? Math.min(100, Math.max(0, data.cacheProgress))
+            : 0;
+          document.querySelector("#trajectoryStatus").textContent =
+            `Đang tính IK và tạo cache đường đi: ${progress}%`;
+        } else if (data.trajectory === true && wasPreparing) {
+          document.querySelector("#trajectoryStatus").textContent =
+            "Đã tạo cache. Robot đang chạy theo đường thẳng A → B.";
+        }
+        if (!controlsDirty) {
+          if (Number.isFinite(data.s1)) servo1.value = String(data.s1);
+          if (Number.isFinite(data.s2)) servo2.value = String(data.s2);
+          updateLabels();
+        }
+      } else if (data.type === "ack" && !data.ok) {
+        trajectoryRunning = false;
+        controls.forEach(control => {
+          control.disabled = !writer;
+        });
+        updateTrajectoryButtons();
+        setStatus(data.error || "Robot từ chối lệnh", "error");
+      } else if (data.type === "error") {
+        trajectoryRunning = false;
+        controls.forEach(control => {
+          control.disabled = !writer;
+        });
+        updateTrajectoryButtons();
+        setStatus(data.message || "Lỗi từ robot", "error");
+      } else if (data.type === "ack" && data.ok) {
+        if (data.preparing === true) {
+          trajectoryRunning = true;
+          controls.forEach(control => {
+            control.disabled = true;
+          });
+          updateTrajectoryButtons();
+          document.querySelector("#trajectoryStatus").textContent =
+            "Đang tính IK cho 1001 điểm (4 điểm mỗi vòng loop)...";
+          setStatus("Đang chuẩn bị cache quỹ đạo", "idle");
+        } else if (Number.isFinite(data.segmentMs)) {
+          document.querySelector("#trajectoryStatus").textContent =
+            `Phát lại cache quỹ đạo. Thời lượng ước tính: ${(data.segmentMs / 1000).toFixed(2)} giây.`;
+          setStatus("Đã bắt đầu phát lại quỹ đạo", "ok");
+        } else {
+          setStatus("Đã gửi lệnh", "ok");
+        }
+      }
+    }
+
+    function packetCrc16(bytes, start, length) {
+      let crc = 0xffff;
+      for (let i = start; i < start + length; i += 1) {
+        crc ^= bytes[i] << 8;
+        for (let bit = 0; bit < 8; bit += 1) {
+          crc = (crc & 0x8000)
+            ? ((crc << 1) ^ 0x1021) & 0xffff
+            : (crc << 1) & 0xffff;
+        }
+      }
+      return crc;
+    }
+
+    function createCommandPacket(type, values = []) {
+      if (values.length > 6 ||
+          !values.every(value => Number.isFinite(value))) {
+        throw new Error("Dữ liệu lệnh nhị phân không hợp lệ");
+      }
+      const packet = new Uint8Array(packetLength);
+      const view = new DataView(packet.buffer);
+      view.setUint8(0, packetMagic[0]);
+      view.setUint8(1, packetMagic[1]);
+      view.setUint8(2, protocolVersion);
+      view.setUint8(3, type);
+      values.forEach((value, index) => {
+        view.setFloat32(4 + index * 4, value, true);
+      });
+      view.setUint16(
+        packetLength - 2,
+        packetCrc16(packet, 0, packetLength - 2),
+        true
+      );
+      return packet;
+    }
+
+    function decodePacket(packet) {
+      const view = new DataView(
+        packet.buffer, packet.byteOffset, packet.byteLength
+      );
+      if (view.getUint8(2) !== protocolVersion) return null;
+      const payloadOffset = 4;
+      const type = view.getUint8(3);
+      if (type === packetTypes.state) {
+        const flags = view.getUint8(payloadOffset + 20);
+        return {
+          type: "state",
+          s1: view.getFloat32(payloadOffset, true),
+          s2: view.getFloat32(payloadOffset + 4, true),
+          x: view.getFloat32(payloadOffset + 8, true),
+          y: view.getFloat32(payloadOffset + 12, true),
+          z: view.getFloat32(payloadOffset + 16, true),
+          trajectory: (flags & 1) !== 0,
+          preparing: (flags & 2) !== 0,
+          cacheProgress: view.getUint8(payloadOffset + 21)
+        };
+      }
+      if (type === packetTypes.ack) {
+        const accepted = view.getUint8(payloadOffset) === 1;
+        const detail = view.getUint8(payloadOffset + 1);
+        const durationMs = view.getUint32(payloadOffset + 2, true);
+        if (accepted && detail !== 0 && detail !== 1) return null;
+        if (!accepted && (detail === 0 || detail === 1)) return null;
+        return {
+          type: "ack",
+          ok: accepted,
+          preparing: accepted && detail === 1,
+          segmentMs: durationMs > 0 ? durationMs : undefined,
+          error: accepted ? undefined :
+            (protocolErrors[detail] || "Robot từ chối lệnh")
+        };
+      }
+      if (type === packetTypes.error) {
+        const code = view.getUint8(payloadOffset);
+        return {
+          type: "error",
+          message: protocolErrors[code] || "Lỗi nội bộ robot"
+        };
+      }
+      return null;
+    }
+
+    function consumeIncomingBytes(chunk) {
+      const combined = new Uint8Array(receiveBuffer.length + chunk.length);
+      combined.set(receiveBuffer);
+      combined.set(chunk, receiveBuffer.length);
+      let offset = 0;
+
+      while (combined.length - offset >= 2) {
+        while (offset + 1 < combined.length &&
+               (combined[offset] !== packetMagic[0] ||
+                combined[offset + 1] !== packetMagic[1])) {
+          offset += 1;
+        }
+        if (combined.length - offset < packetLength) break;
+
+        const candidate = combined.subarray(offset, offset + packetLength);
+        const view = new DataView(
+          candidate.buffer, candidate.byteOffset, candidate.byteLength
+        );
+        const expectedCrc = view.getUint16(packetLength - 2, true);
+        if (view.getUint8(2) !== protocolVersion ||
+            packetCrc16(candidate, 0, packetLength - 2) !== expectedCrc) {
+          offset += 1;
+          continue;
+        }
+
+        const decoded = decodePacket(candidate);
+        if (decoded) handleMessage(decoded);
+        offset += packetLength;
+      }
+
+      receiveBuffer = combined.slice(offset);
+      if (receiveBuffer.length > packetLength - 1) {
+        receiveBuffer = receiveBuffer.slice(-1);
+      }
+    }
+
+    async function readLoop() {
+      try {
+        while (port && port.readable) {
+          reader = port.readable.getReader();
+          try {
+            while (true) {
+              const { value, done } = await reader.read();
+              if (done) break;
+              consumeIncomingBytes(value);
+            }
+          } finally {
+            reader.releaseLock();
+            reader = null;
+          }
+        }
+      } catch (error) {
+        if (port) setStatus(`Lỗi UART: ${error.message}`, "error");
+      }
+    }
+
+    async function connect() {
+      try {
+        port = await navigator.serial.requestPort();
+        await port.open({ baudRate: 115200 });
+        receiveBuffer = new Uint8Array(0);
+        writer = port.writable.getWriter();
+        connectButton.textContent = "Ngắt kết nối";
+        controls.forEach(control => control.disabled = false);
+        stopButton.disabled = false;
+        setStatus("Đã kết nối UART", "ok");
+        updateJointLimits();
+        updateTrajectoryButtons();
+        readLoop();
+        await sendCommand(commandTypes.getState);
+      } catch (error) {
+        port = null;
+        writer = null;
+        setStatus(`Không thể kết nối: ${error.message}`, "error");
+      }
+    }
+
+    async function disconnect() {
+      const activePort = port;
+      port = null;
+      receiveBuffer = new Uint8Array(0);
+      if (setCommandTimer !== null) {
+        clearTimeout(setCommandTimer);
+        setCommandTimer = null;
+      }
+      pendingSetCommand = false;
+      if (reader) await reader.cancel().catch(() => {});
+      if (writer) {
+        writer.releaseLock();
+        writer = null;
+      }
+      if (activePort) await activePort.close().catch(() => {});
+      connectButton.textContent = "Kết nối UART";
+      controls.forEach(control => control.disabled = true);
+      stopButton.disabled = true;
+      updateTrajectoryButtons();
+      setStatus("Đã ngắt kết nối");
+    }
+
+    async function sendCommand(type, values = []) {
+      if (!writer) return;
+      await writer.write(createCommandPacket(type, values));
+    }
+
+    function scheduleSetCommand() {
+      if (!writer) return;
+      pendingSetCommand = true;
+      if (setCommandTimer !== null) return;
+
+      const delay = Math.max(
+        0,
+        minimumSetCommandIntervalMs - (performance.now() - lastSetCommandAt)
+      );
+      setCommandTimer = setTimeout(() => {
+        setCommandTimer = null;
+        flushSetCommand();
+      }, delay);
+    }
+
+    async function flushSetCommand() {
+      if (!writer || !pendingSetCommand) return;
+      updateJointLimits();
+
+      const firstAngle = Number(servo1.value);
+      const secondAngle = Number(servo2.value);
+      const targetAngle = Number(stepAngle.value);
+      if (!Number.isFinite(firstAngle) || !Number.isFinite(secondAngle) ||
+          !Number.isFinite(targetAngle)) {
+        pendingSetCommand = false;
+        setStatus("Góc điều khiển không hợp lệ", "error");
+        return;
+      }
+
+      pendingSetCommand = false;
+      lastSetCommandAt = performance.now();
+      try {
+        await sendCommand(commandTypes.setJoints, [
+          firstAngle, secondAngle, targetAngle
+        ]);
+        setStatus("Đang gửi góc...", "idle");
+      } catch (error) {
+        setStatus(`Gửi UART thất bại: ${error.message}`, "error");
+      }
+
+      if (pendingSetCommand) scheduleSetCommand();
+    }
+
+    connectButton.addEventListener("click", () => {
+      if (port) disconnect();
+      else connect();
+    });
+
+    for (const control of controls) {
+      control.addEventListener("input", () => {
+        controlsDirty = true;
+        updateLabels();
+        scheduleSetCommand();
+      });
+    }
+
+    stopButton.addEventListener("click", async () => {
+      if (setCommandTimer !== null) {
+        clearTimeout(setCommandTimer);
+        setCommandTimer = null;
+      }
+      pendingSetCommand = false;
+      try {
+        await sendCommand(commandTypes.stop);
+        setStatus("Đã gửi lệnh dừng", "idle");
+      } catch (error) {
+        setStatus(`Gửi UART thất bại: ${error.message}`, "error");
+      }
+    });
+
+    savePointAButton.addEventListener("click", () => saveCurrentPoint("A"));
+    savePointBButton.addEventListener("click", () => saveCurrentPoint("B"));
+
+    playTrajectoryButton.addEventListener("click", async () => {
+      if (!writer || !pointA || !pointB || trajectoryRunning) return;
+
+      if (setCommandTimer !== null) {
+        clearTimeout(setCommandTimer);
+        setCommandTimer = null;
+      }
+      pendingSetCommand = false;
+      trajectoryRunning = true;
+      controls.forEach(control => control.disabled = true);
+      updateTrajectoryButtons();
+      try {
+        await sendCommand(commandTypes.playTrajectory, [
+          pointA.x, pointA.y, pointA.z,
+          pointB.x, pointB.y, pointB.z
+        ]);
+        setStatus("Đang bắt đầu nội suy A → B...", "idle");
+      } catch (error) {
+        trajectoryRunning = false;
+        controls.forEach(control => control.disabled = false);
+        updateTrajectoryButtons();
+        setStatus(`Gửi UART thất bại: ${error.message}`, "error");
+      }
+    });
+
+    pointA = loadSavedPoint(pointAStorageKey, "pointAValue", "A");
+    pointB = loadSavedPoint(pointBStorageKey, "pointBValue", "B");
+    updateLabels();
+    updateTrajectoryButtons();
+  </script>
+</body>
+</html>
