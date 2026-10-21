@@ -5,4 +5,4 @@
 void asInit();
 
 uint16_t readRawAngle();
-float AngleDeg();
+float AngleDeg();

@@ -52,14 +52,17 @@ bool InvertKinematics(float x, float y, float z, float *theta1, float *theta2, f
 }
 
 bool checkCondition(float angle1, float angle2){
-  if(angle1 >= SERVO1_MIN_DEG && angle1 < 30.0f){
-    return angle2 >= SERVO2_MIN_DEG && angle2 <= angle1 + 150.0f;
+  // eps: sai số làm tròn float của IK ở đúng biên không được coi là vi phạm
+  constexpr float eps = 0.1f;
+  if(angle1 < SERVO1_MIN_DEG - eps || angle1 > SERVO1_MAX_DEG + eps ||
+     angle2 < SERVO2_MIN_DEG - eps || angle2 > SERVO2_MAX_DEG + eps){
+    return false;
   }
-  if(angle1 >= 30.0f && angle1 <= 60.0f){
-    return angle2 >= SERVO2_MIN_DEG && angle2 <= SERVO2_MAX_DEG;
+  if(angle1 < 30.0f){
+    return angle2 <= angle1 + 150.0f + eps;
   }
-  if(angle1 > 60.0f && angle1 <= SERVO1_MAX_DEG){
-    return angle2 >= angle1 + 30.0f && angle2 <= SERVO2_MAX_DEG;
+  if(angle1 <= 60.0f){
+    return true;
   }
-  return false;
+  return angle2 >= angle1 + 30.0f - eps;
 }

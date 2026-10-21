@@ -2,7 +2,8 @@
 
 void asInit(){
     Wire.begin(SDA, SCL);
-    Wire.setClock(400000);
+    Wire.setClock(800000);
+    Wire.setTimeOut(2);  // ms: tránh chặn quá lâu nhịp điều khiển 400 Hz
 }
 
 uint16_t readRawAngle() {

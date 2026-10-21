@@ -5,14 +5,14 @@
 #include "PWM.h"
 #include "config.h"
 #include "kinematics.h"
+#include "motion.h"
 #include "stepper.h"
 
 namespace {
 constexpr uint32_t telemetryPeriodMs = 100;
 constexpr uint32_t controlPeriodMs = 1000UL / LOOP_FREQ;
-constexpr uint16_t trajectoryPointCount = 1000;
-constexpr uint8_t trajectoryPointsPerLoop = 4;
-constexpr float maximumJointStepPerLoopDeg = JOINT_ANGLE_RESOLUTION_DEG;
+constexpr float loopDtS = 1.0f / (float)LOOP_FREQ;
+constexpr float jointLimitEpsilonDeg = 0.15f;  // cho phép sai số làm tròn của IK ở biên
 constexpr uint8_t packetMagicFirst = 0x52;
 constexpr uint8_t packetMagicSecond = 0x42;
 constexpr uint8_t packetVersion = 1;
@@ -43,7 +43,9 @@ enum CommunicationError : uint8_t {
   errorJointTargetInvalid = 14,
   errorPointNotFinite = 15,
   errorUnknownCommand = 16,
-  errorJointCommandNotFinite = 17
+  errorJointCommandNotFinite = 17,
+  errorStepperStall = 18,
+  errorTrajectoryCacheFull = 19
 };
 
 #pragma pack(push, 1)
@@ -66,32 +68,45 @@ struct CartesianPoint {
   float z;
 };
 
-struct JointTarget {
-  float servo1;
-  float servo2;
-  float step;
-};
+enum class Mode : uint8_t { Idle, Building, Seeking, Playing, Settling };
 
 uint8_t receiveBuffer[sizeof(CommunicationPacket) * 4];
 size_t receiveLength = 0;
 uint32_t lastTelemetryMs = 0;
-JointTarget trajectoryCache[trajectoryPointCount + 1];
-float trajectoryDistance[trajectoryPointCount + 1];
-CartesianPoint cachedPointA = {0.0f, 0.0f, 0.0f};
-CartesianPoint cachedPointB = {0.0f, 0.0f, 0.0f};
-CartesianPoint requestedPointA = {0.0f, 0.0f, 0.0f};
-CartesianPoint requestedPointB = {0.0f, 0.0f, 0.0f};
-JointTarget trajectorySeekStart = {0.0f, 0.0f, 0.0f};
-uint16_t cacheBuildIndex = 0;
-uint16_t trajectoryFrame = 0;
-uint16_t trajectorySeekFrames = 0;
-uint32_t trajectoryPlaybackFrame = 0;
-uint32_t trajectoryPlaybackFrames = 0;
-float trajectoryTotalDistance = 0.0f;
-uint8_t trajectoryPhase = 0;
-bool trajectoryCacheValid = false;
-bool trajectoryCacheBuilding = false;
 
+// ---- Quỹ đạo A-B ----
+Trajectory path;  // cache các điểm IK (float, KHÔNG lượng tử hóa) + thời gian
+CartesianPoint cachedPointA = {0, 0, 0};
+CartesianPoint cachedPointB = {0, 0, 0};
+CartesianPoint requestedPointA = {0, 0, 0};
+CartesianPoint requestedPointB = {0, 0, 0};
+bool cacheValid = false;
+bool playReverse = false;
+uint16_t buildIndex = 0;
+uint16_t buildCount = 0;
+
+Mode mode = Mode::Idle;
+Joint seekFrom = {0, 0, 0};
+Joint seekTo = {0, 0, 0};
+Profile seekProfile;
+float motionTimeS = 0.0f;
+
+// ---- Kéo thanh trượt (jog) ----
+AxisTracker tracker[3];
+Joint manualTarget = {0, 0, 0};
+bool manualActive = false;
+
+// ---- Giám sát ----
+uint8_t lostTicks = 0;
+uint8_t stallWindowTicks = 0;
+uint8_t noProgressWindows = 0;
+uint16_t settleTicks = 0;
+int16_t trimBudget = 0;
+uint8_t movingTrimTicks = 0;
+int32_t stallWindowStartSteps = 0;
+float stallWindowStartAngle = NAN;
+
+// ---- Tiện ích gói tin ----
 uint16_t packetCrc(const uint8_t *data, size_t length) {
   uint16_t crc = 0xFFFF;
   for (size_t i = 0; i < length; ++i) {
@@ -104,22 +119,18 @@ uint16_t packetCrc(const uint8_t *data, size_t length) {
   return crc;
 }
 
-void writePacket(uint8_t type, const uint8_t *payload,
-                 size_t payloadLength) {
+void writePacket(uint8_t type, const uint8_t *payload, size_t payloadLength) {
   CommunicationPacket packet = {};
   packet.magic[0] = packetMagicFirst;
   packet.magic[1] = packetMagicSecond;
   packet.version = packetVersion;
   packet.type = type;
   if (payload != nullptr && payloadLength > 0) {
-    if (payloadLength > sizeof(packet.payload)) {
-      payloadLength = sizeof(packet.payload);
-    }
+    if (payloadLength > sizeof(packet.payload)) payloadLength = sizeof(packet.payload);
     memcpy(packet.payload, payload, payloadLength);
   }
-  packet.crc = packetCrc(
-    reinterpret_cast<const uint8_t *>(&packet),
-    sizeof(packet) - sizeof(packet.crc));
+  packet.crc = packetCrc(reinterpret_cast<const uint8_t *>(&packet),
+                         sizeof(packet) - sizeof(packet.crc));
   Serial.write(reinterpret_cast<const uint8_t *>(&packet), sizeof(packet));
 }
 
@@ -141,9 +152,10 @@ uint8_t errorCodeForMessage(const char *message) {
     return errorServoCondition;
   if (strcmp(message, "stepper feedback is not ready") == 0)
     return errorStepperFeedbackNotReady;
-  if (strcmp(message,
-             "trajectory contains an unreachable or forbidden point") == 0)
+  if (strcmp(message, "trajectory contains an unreachable or forbidden point") == 0)
     return errorTrajectoryPointInvalid;
+  if (strcmp(message, "trajectory cache capacity exceeded") == 0)
+    return errorTrajectoryCacheFull;
   if (strcmp(message, "trajectory point violates joint limits") == 0)
     return errorTrajectoryJointLimit;
   if (strcmp(message, "AS5600 feedback lost or outside step limits") == 0 ||
@@ -157,110 +169,76 @@ uint8_t errorCodeForMessage(const char *message) {
     return errorUnknownCommand;
   if (strcmp(message, "joint command is not finite") == 0)
     return errorJointCommandNotFinite;
+  if (strcmp(message, "stepper lost steps or is stalled") == 0)
+    return errorStepperStall;
   return errorCommandInvalid;
 }
 
-float quantizeJointAngle(float angleDeg) {
-  return roundf(angleDeg / JOINT_ANGLE_RESOLUTION_DEG) *
-         JOINT_ANGLE_RESOLUTION_DEG;
+// ---- Khớp / giới hạn ----
+SpeedLimits speedLimits() {
+  return { SERVO_MAX_SPEED_DEG_PER_SEC, SERVO_MAX_SPEED_DEG_PER_SEC,
+           STEPPER_MAX_SPEED_DEG_PER_SEC };
 }
 
-JointTarget interpolate(const JointTarget &start,
-                        const JointTarget &end, float t) {
-  return {
-    quantizeJointAngle(start.servo1 + (end.servo1 - start.servo1) * t),
-    quantizeJointAngle(start.servo2 + (end.servo2 - start.servo2) * t),
-    quantizeJointAngle(start.step + (end.step - start.step) * t)
-  };
+Joint commandedJoint(const RobotControlState &s) {
+  return { s.servo1Angle, s.servo2Angle, s.stepTargetAngle };
 }
 
-CartesianPoint interpolate(const CartesianPoint &start,
-                           const CartesianPoint &end, float t) {
-  return {
-    start.x + (end.x - start.x) * t,
-    start.y + (end.y - start.y) * t,
-    start.z + (end.z - start.z) * t
-  };
+CartesianPoint lerpPoint(const CartesianPoint &a, const CartesianPoint &b, float t) {
+  return { a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t, a.z + (b.z - a.z) * t };
 }
 
-bool solvePoint(const CartesianPoint &point, JointTarget &target) {
-  float relativeServo2;
-  if (!InvertKinematics(point.x, point.y, point.z,
-                        &target.servo1, &relativeServo2, &target.step)) {
-    return false;
-  }
-
-  target.servo2 = target.servo1 + relativeServo2;
-  return isfinite(target.servo1) && isfinite(target.servo2) &&
-         isfinite(target.step) &&
-         target.servo1 >= SERVO1_MIN_DEG &&
-         target.servo1 <= SERVO1_MAX_DEG &&
-         target.servo2 >= SERVO2_MIN_DEG &&
-         target.servo2 <= SERVO2_MAX_DEG &&
-         target.step >= STEPPER_MIN_DEG &&
-         target.step <= STEPPER_MAX_DEG &&
-         checkCondition(target.servo1, target.servo2);
+bool limitsOk(const Joint &j) {
+  return isfinite(j.s1) && isfinite(j.s2) && isfinite(j.st) &&
+         j.s1 >= SERVO1_MIN_DEG - jointLimitEpsilonDeg &&
+         j.s1 <= SERVO1_MAX_DEG + jointLimitEpsilonDeg &&
+         j.s2 >= SERVO2_MIN_DEG - jointLimitEpsilonDeg &&
+         j.s2 <= SERVO2_MAX_DEG + jointLimitEpsilonDeg &&
+         j.st >= STEPPER_MIN_DEG - jointLimitEpsilonDeg &&
+         j.st <= STEPPER_MAX_DEG + jointLimitEpsilonDeg;
 }
 
-bool validJointTarget(const JointTarget &target) {
-  return target.servo1 >= SERVO1_MIN_DEG &&
-         target.servo1 <= SERVO1_MAX_DEG &&
-         target.servo2 >= SERVO2_MIN_DEG &&
-         target.servo2 <= SERVO2_MAX_DEG &&
-         target.step >= STEPPER_MIN_DEG &&
-         target.step <= STEPPER_MAX_DEG &&
-         checkCondition(target.servo1, target.servo2);
+Joint clampJoint(Joint j) {
+  j.s1 = fminf(SERVO1_MAX_DEG, fmaxf(SERVO1_MIN_DEG, j.s1));
+  j.s2 = fminf(SERVO2_MAX_DEG, fmaxf(SERVO2_MIN_DEG, j.s2));
+  j.st = fminf(STEPPER_MAX_DEG, fmaxf(STEPPER_MIN_DEG, j.st));
+  return j;
 }
 
-float jointDistance(const JointTarget &left, const JointTarget &right) {
-  return fmaxf(fabsf(left.servo1 - right.servo1),
-               fmaxf(fabsf(left.servo2 - right.servo2),
-                     fabsf(left.step - right.step)));
+bool validJoint(const Joint &j) {
+  return limitsOk(j) && checkCondition(j.s1, j.s2);
 }
 
-bool validateJointSegment(const JointTarget &start, const JointTarget &end) {
-  const uint16_t frames = (uint16_t)fmaxf(
-    1.0f, ceilf(jointDistance(start, end) /
-                maximumJointStepPerLoopDeg));
-  for (uint16_t frame = 0; frame <= frames; ++frame) {
-    const JointTarget target = interpolate(
-      start, end, (float)frame / (float)frames);
-    if (!validJointTarget(target)) {
-      return false;
-    }
+bool solvePoint(const CartesianPoint &p, Joint &out) {
+  float relServo2;
+  Joint j;
+  if (!InvertKinematics(p.x, p.y, p.z, &j.s1, &relServo2, &j.st)) return false;
+  j.s2 = j.s1 + relServo2;
+  if (!validJoint(j)) return false;
+  out = clampJoint(j);
+  return true;
+}
+
+// Kiểm tra đoạn thẳng trong không gian khớp (mẫu mỗi 0.5 độ).
+bool validateJointSegment(const Joint &a, const Joint &b) {
+  const float dist = fmaxf(fabsf(b.s1 - a.s1),
+                           fmaxf(fabsf(b.s2 - a.s2), fabsf(b.st - a.st)));
+  float frames = ceilf(dist / 0.5f);
+  if (frames < 1.0f) frames = 1.0f;
+  if (frames > 720.0f) frames = 720.0f;
+  const uint16_t n = (uint16_t)frames;
+  for (uint16_t i = 0; i <= n; ++i) {
+    if (!validJoint(lerpJoint(a, b, (float)i / (float)n))) return false;
   }
   return true;
 }
 
-bool sameCartesianPoint(const CartesianPoint &left,
-                        const CartesianPoint &right) {
-  constexpr float coordinateTolerance = 0.005f;
-  return fabsf(left.x - right.x) <= coordinateTolerance &&
-         fabsf(left.y - right.y) <= coordinateTolerance &&
-         fabsf(left.z - right.z) <= coordinateTolerance;
+bool sameCartesianPoint(const CartesianPoint &l, const CartesianPoint &r) {
+  constexpr float tol = 0.005f;
+  return fabsf(l.x - r.x) <= tol && fabsf(l.y - r.y) <= tol && fabsf(l.z - r.z) <= tol;
 }
 
-void startTrajectoryPlayback(RobotControlState &state) {
-  trajectoryCacheBuilding = false;
-  state.trajectoryPreparing = false;
-  trajectorySeekStart = {
-    quantizeJointAngle(state.servo1Angle),
-    quantizeJointAngle(state.servo2Angle),
-    quantizeJointAngle(state.measuredStepAngle)
-  };
-  trajectorySeekFrames =
-    (uint16_t)fmaxf(1.0f, ceilf(jointDistance(
-      trajectorySeekStart, trajectoryCache[0]) /
-      maximumJointStepPerLoopDeg));
-  trajectoryFrame = 0;
-  trajectoryPlaybackFrame = 0;
-  trajectoryPlaybackFrames = (uint32_t)fmaxf(
-    1.0f, ceilf(trajectoryTotalDistance / maximumJointStepPerLoopDeg));
-  trajectoryPhase = 0;
-  state.trajectoryActive = true;
-  state.feedbackActive = true;
-}
-
+// ---- Gửi dữ liệu ----
 void sendPreparingAck() {
   uint8_t payload[24] = {};
   payload[0] = 1;
@@ -268,51 +246,34 @@ void sendPreparingAck() {
   writePacket(packetAck, payload, sizeof(payload));
 }
 
-void stopTrajectory(RobotControlState &state) {
-  if (trajectoryCacheBuilding) {
-    trajectoryCacheBuilding = false;
-    trajectoryCacheValid = false;
-  }
-  state.trajectoryActive = false;
-  state.trajectoryPreparing = false;
-  state.feedbackActive = false;
-  stopStepper();
-}
-
 void sendState(const RobotControlState &state) {
-  float x = NAN;
-  float y = NAN;
-  float z = NAN;
+  float x = NAN, y = NAN, z = NAN;
   if (isfinite(state.measuredStepAngle)) {
-    ForwardKinematics(state.servo1Angle,
-                      state.servo2Angle - state.servo1Angle,
+    ForwardKinematics(state.servo1Angle, state.servo2Angle - state.servo1Angle,
                       state.measuredStepAngle, &x, &y, &z);
   }
-
   uint8_t payload[24] = {};
   memcpy(&payload[0], &state.servo1Angle, sizeof(float));
   memcpy(&payload[4], &state.servo2Angle, sizeof(float));
   memcpy(&payload[8], &x, sizeof(float));
   memcpy(&payload[12], &y, sizeof(float));
   memcpy(&payload[16], &z, sizeof(float));
-  payload[20] = (state.trajectoryActive ? 1 : 0) |
-                (state.trajectoryPreparing ? 2 : 0);
-  const uint16_t completedPoints = cacheBuildIndex > trajectoryPointCount
-    ? trajectoryPointCount : cacheBuildIndex;
-  payload[21] = (uint8_t)(
-    (uint32_t)completedPoints * 100UL / trajectoryPointCount);
+  payload[20] = (state.trajectoryActive ? 1 : 0) | (state.trajectoryPreparing ? 2 : 0);
+  uint8_t progress = 0;
+  if (mode == Mode::Building && buildCount > 0) {
+    progress = (uint8_t)((uint32_t)buildIndex * 100UL / buildCount);
+  } else if (cacheValid) {
+    progress = 100;
+  }
+  payload[21] = progress;
   writePacket(packetState, payload, sizeof(payload));
 }
 
-void sendAck(const RobotControlState &state, bool accepted,
-             const char *error = nullptr,
-             uint32_t trajectoryDuration = 0) {
-  (void)state;
+void sendAck(bool accepted, const char *error = nullptr, uint32_t durationMs = 0) {
   uint8_t payload[24] = {};
   payload[0] = accepted ? 1 : 0;
-  payload[1] = error != nullptr
-    ? errorCodeForMessage(error) : errorNone;
-  memcpy(&payload[2], &trajectoryDuration, sizeof(trajectoryDuration));
+  payload[1] = error != nullptr ? errorCodeForMessage(error) : (uint8_t)errorNone;
+  memcpy(&payload[2], &durationMs, sizeof(durationMs));
   writePacket(packetAck, payload, sizeof(payload));
 }
 
@@ -322,80 +283,116 @@ float readPacketFloat(const CommunicationPacket &packet, size_t offset) {
   return value;
 }
 
-void processCommand(const CommunicationPacket &packet,
-                    RobotControlState &state) {
+// ---- Điều khiển chuyển động ----
+void haltMotion(RobotControlState &state) {
+  if (mode == Mode::Building) cacheValid = false;
+  mode = Mode::Idle;
+  manualActive = false;
+  state.trajectoryActive = false;
+  state.trajectoryPreparing = false;
+  state.feedbackActive = false;
+  stallWindowTicks = 0;
+  noProgressWindows = 0;
+  // Không còn hàng đợi xung: dừng ngay tại vị trí lệnh hiện tại.
+}
+
+void failMotion(RobotControlState &state, const char *message) {
+  haltMotion(state);
+  robotCommsSendError(message);
+}
+
+void beginSeek(RobotControlState &state, const Joint &from, const Joint &to) {
+  seekFrom = from;
+  seekTo = to;
+  seekProfile.init(minMoveTime(from, to, speedLimits()), MOTION_ACCEL_TIME_S);
+  motionTimeS = 0.0f;
+  mode = Mode::Seeking;
+  manualActive = false;
+  trimBudget = STEPPER_TRIM_BUDGET_STEPS;
+  stallWindowTicks = 0;
+  noProgressWindows = 0;
+  stallWindowStartSteps = getStepperSteps();
+  stallWindowStartAngle = state.measuredStepAngle;
+  movingTrimTicks = 0;
+  state.trajectoryPreparing = false;
+  state.trajectoryActive = true;
+  state.feedbackActive = true;
+}
+
+uint32_t plannedDurationMs() {
+  return (uint32_t)((seekProfile.T + path.duration()) * 1000.0f);
+}
+
+void processCommand(const CommunicationPacket &packet, RobotControlState &state) {
   if (packet.type == commandGetState) {
     sendState(state);
     return;
   }
 
   if (packet.type == commandPlayTrajectory) {
-    const CartesianPoint pointA = {
-      readPacketFloat(packet, 0),
-      readPacketFloat(packet, 4),
-      readPacketFloat(packet, 8)
-    };
-    const CartesianPoint pointB = {
-      readPacketFloat(packet, 12),
-      readPacketFloat(packet, 16),
-      readPacketFloat(packet, 20)
-    };
-    if (!isfinite(pointA.x) || !isfinite(pointA.y) ||
-        !isfinite(pointA.z) || !isfinite(pointB.x) ||
-        !isfinite(pointB.y) || !isfinite(pointB.z)) {
-      sendAck(state, false, "trajectory point is not finite");
+    const CartesianPoint pointA = { readPacketFloat(packet, 0), readPacketFloat(packet, 4),
+                                    readPacketFloat(packet, 8) };
+    const CartesianPoint pointB = { readPacketFloat(packet, 12), readPacketFloat(packet, 16),
+                                    readPacketFloat(packet, 20) };
+    if (!isfinite(pointA.x) || !isfinite(pointA.y) || !isfinite(pointA.z) ||
+        !isfinite(pointB.x) || !isfinite(pointB.y) || !isfinite(pointB.z)) {
+      sendAck(false, "trajectory point is not finite");
       return;
     }
-    if (state.trajectoryActive || state.trajectoryPreparing) {
-      sendAck(state, false, "trajectory is already running or preparing");
+    if (mode != Mode::Idle || state.trajectoryActive || state.trajectoryPreparing) {
+      sendAck(false, "trajectory is already running or preparing");
       return;
     }
     if (!state.stepperReady || !isfinite(state.measuredStepAngle)) {
-      sendAck(state, false, "stepper position is not ready");
+      sendAck(false, "stepper position is not ready");
       return;
     }
-    JointTarget targetA;
+    Joint targetA;
     if (!solvePoint(pointA, targetA)) {
-      sendAck(state, false,
-              "point A is unreachable or violates joint limits");
+      sendAck(false, "point A is unreachable or violates joint limits");
       return;
     }
-    targetA.servo1 = quantizeJointAngle(targetA.servo1);
-    targetA.servo2 = quantizeJointAngle(targetA.servo2);
-    targetA.step = quantizeJointAngle(targetA.step);
-
-    const JointTarget current = {
-      quantizeJointAngle(state.servo1Angle),
-      quantizeJointAngle(state.servo2Angle),
-      quantizeJointAngle(state.measuredStepAngle)
-    };
-    if (!validJointTarget(current) || !validJointTarget(targetA) ||
-        !validateJointSegment(current, targetA)) {
-      sendAck(state, false, "joint move to point A crosses a forbidden angle");
+    const Joint current = commandedJoint(state);
+    if (!validJoint(current) || !validateJointSegment(current, targetA)) {
+      sendAck(false, "joint move to point A crosses a forbidden angle");
       return;
     }
 
+    manualActive = false;
     requestedPointA = pointA;
     requestedPointB = pointB;
-    if (trajectoryCacheValid && sameCartesianPoint(pointA, cachedPointA) &&
-        sameCartesianPoint(pointB, cachedPointB)) {
-      if (!validateJointSegment(current, trajectoryCache[0])) {
-        sendAck(state, false, "joint move to point A crosses a forbidden angle");
+
+    // Đã có cache: A->B chạy xuôi, B->A chạy ngược chính cache đó (không dựng lại).
+    const bool forwardHit = cacheValid && sameCartesianPoint(pointA, cachedPointA) &&
+                            sameCartesianPoint(pointB, cachedPointB);
+    const bool reverseHit = cacheValid && sameCartesianPoint(pointA, cachedPointB) &&
+                            sameCartesianPoint(pointB, cachedPointA);
+    if (forwardHit || reverseHit) {
+      playReverse = reverseHit;
+      const Joint start = playReverse ? path.last() : path.first();
+      if (!validateJointSegment(current, start)) {
+        sendAck(false, "joint move to point A crosses a forbidden angle");
         return;
       }
-      startTrajectoryPlayback(state);
-      const uint32_t durationMs =
-        (uint32_t)(trajectorySeekFrames + trajectoryPlaybackFrames) *
-        controlPeriodMs;
-      sendAck(state, true, nullptr, durationMs);
+      beginSeek(state, current, start);
+      sendAck(true, nullptr, plannedDurationMs());
       return;
     }
 
-    cacheBuildIndex = 0;
-    trajectoryTotalDistance = 0.0f;
-    trajectoryCacheBuilding = true;
-    trajectoryCacheValid = false;
-    stopStepper();
+    // Chưa có cache: dựng từng điểm, mỗi tick 1 lần IK.
+    const float dx = pointB.x - pointA.x, dy = pointB.y - pointA.y, dz = pointB.z - pointA.z;
+    const float len = sqrtf(dx * dx + dy * dy + dz * dz);
+    float n = ceilf(len / PATH_SAMPLE_MM) + 1.0f;
+    if (n < 2.0f) n = 2.0f;
+    if (n > (float)Trajectory::kMaxInputPoints) {
+      n = (float)Trajectory::kMaxInputPoints;
+    }
+    buildCount = (uint16_t)n;
+    buildIndex = 0;
+    playReverse = false;
+    path.clear();
+    cacheValid = false;
+    mode = Mode::Building;
     state.trajectoryActive = false;
     state.trajectoryPreparing = true;
     state.feedbackActive = false;
@@ -404,60 +401,55 @@ void processCommand(const CommunicationPacket &packet,
   }
 
   if (packet.type == commandStop) {
-    stopTrajectory(state);
-    sendAck(state, true);
+    haltMotion(state);
+    sendAck(true);
     return;
   }
 
   if (packet.type != commandSetJoints) {
-    sendAck(state, false, "unknown binary command");
+    sendAck(false, "unknown binary command");
     return;
   }
 
-  float requestedServo1 = readPacketFloat(packet, 0);
-  float requestedServo2 = readPacketFloat(packet, 4);
-  float requestedStep = readPacketFloat(packet, 8);
-  if (!isfinite(requestedServo1) || !isfinite(requestedServo2) ||
-      !isfinite(requestedStep)) {
-    sendAck(state, false, "joint command is not finite");
+  Joint request = { readPacketFloat(packet, 0), readPacketFloat(packet, 4),
+                    readPacketFloat(packet, 8) };
+  if (!isfinite(request.s1) || !isfinite(request.s2) || !isfinite(request.st)) {
+    sendAck(false, "joint command is not finite");
     return;
   }
-  if (state.trajectoryActive || state.trajectoryPreparing) {
-    sendAck(state, false, "stop trajectory before setting joint angles");
+  if (mode != Mode::Idle || state.trajectoryActive || state.trajectoryPreparing) {
+    sendAck(false, "stop trajectory before setting joint angles");
     return;
   }
-
-  requestedServo1 = quantizeJointAngle(requestedServo1);
-  requestedServo2 = quantizeJointAngle(requestedServo2);
-  requestedStep = quantizeJointAngle(requestedStep);
-
-  if (requestedServo1 < SERVO1_MIN_DEG ||
-      requestedServo1 > SERVO1_MAX_DEG ||
-      requestedServo2 < SERVO2_MIN_DEG ||
-      requestedServo2 > SERVO2_MAX_DEG ||
-      requestedStep < STEPPER_MIN_DEG ||
-      requestedStep > STEPPER_MAX_DEG) {
-    sendAck(state, false, "angle outside joint limits");
+  if (!limitsOk(request)) {
+    sendAck(false, "angle outside joint limits");
     return;
   }
-  if (!checkCondition(requestedServo1, requestedServo2)) {
-    sendAck(state, false, "servo angles violate joint condition");
+  request = clampJoint(request);
+  if (!checkCondition(request.s1, request.s2)) {
+    sendAck(false, "servo angles violate joint condition");
     return;
   }
-  if (!state.stepperReady ||
-      !moveToAngleFeedback(requestedStep)) {
-    sendAck(state, false, "stepper feedback is not ready");
+  if (!state.stepperReady) {
+    sendAck(false, "stepper feedback is not ready");
     return;
   }
 
-  state.trajectoryActive = false;
-  state.servo1Angle = requestedServo1;
-  state.servo2Angle = requestedServo2;
-  state.stepTargetAngle = requestedStep;
+  if (!manualActive) {
+    tracker[0].reset(state.servo1Angle);
+    tracker[1].reset(state.servo2Angle);
+    tracker[2].reset(state.stepTargetAngle);
+  }
+  manualTarget = request;
+  manualActive = true;
+  trimBudget = STEPPER_TRIM_BUDGET_STEPS;
+  stallWindowTicks = 0;
+  noProgressWindows = 0;
+  stallWindowStartSteps = getStepperSteps();
+  stallWindowStartAngle = state.measuredStepAngle;
+  movingTrimTicks = 0;
   state.feedbackActive = true;
-  setStepperRate((float)STEP_RATE_HZ);
-  runPwm(state.servo1Angle, state.servo2Angle, 0.0f, 0.0f);
-  sendAck(state, true);
+  sendAck(true);
 }
 
 void consumeReceivedBytes(RobotControlState &state) {
@@ -477,12 +469,10 @@ void consumeReceivedBytes(RobotControlState &state) {
       ++headerOffset;
     }
     if (headerOffset > 0) {
-      memmove(receiveBuffer, receiveBuffer + headerOffset,
-              receiveLength - headerOffset);
+      memmove(receiveBuffer, receiveBuffer + headerOffset, receiveLength - headerOffset);
       receiveLength -= headerOffset;
     }
-    if (receiveLength < 2 ||
-        receiveBuffer[0] != packetMagicFirst ||
+    if (receiveLength < 2 || receiveBuffer[0] != packetMagicFirst ||
         receiveBuffer[1] != packetMagicSecond ||
         receiveLength < sizeof(CommunicationPacket)) {
       continue;
@@ -491,105 +481,72 @@ void consumeReceivedBytes(RobotControlState &state) {
     if (receiveBuffer[2] != packetVersion ||
         packetCrc(receiveBuffer, sizeof(CommunicationPacket) - 2) !=
           (uint16_t)(receiveBuffer[sizeof(CommunicationPacket) - 2] |
-            ((uint16_t)receiveBuffer[sizeof(CommunicationPacket) - 1] << 8))) {
+                     ((uint16_t)receiveBuffer[sizeof(CommunicationPacket) - 1] << 8))) {
       memmove(receiveBuffer, receiveBuffer + 1, --receiveLength);
       continue;
     }
 
     CommunicationPacket packet;
     memcpy(&packet, receiveBuffer, sizeof(packet));
-    memmove(receiveBuffer, receiveBuffer + sizeof(packet),
-            receiveLength - sizeof(packet));
+    memmove(receiveBuffer, receiveBuffer + sizeof(packet), receiveLength - sizeof(packet));
     receiveLength -= sizeof(packet);
     processCommand(packet, state);
   }
 }
 
-void buildTrajectoryCacheBatch(RobotControlState &state) {
-  uint8_t calculatedPoints = 0;
-  while (cacheBuildIndex <= trajectoryPointCount &&
-         calculatedPoints < trajectoryPointsPerLoop) {
-    const float t = (float)cacheBuildIndex / trajectoryPointCount;
-    const CartesianPoint point = interpolate(requestedPointA, requestedPointB, t);
-    JointTarget target;
-    if (!solvePoint(point, target)) {
-      trajectoryCacheBuilding = false;
-      trajectoryCacheValid = false;
-      state.trajectoryPreparing = false;
-      robotCommsSendError("trajectory contains an unreachable or forbidden point");
-      return;
-    }
-
-    target.servo1 = quantizeJointAngle(target.servo1);
-    target.servo2 = quantizeJointAngle(target.servo2);
-    target.step = quantizeJointAngle(target.step);
-    if (!validJointTarget(target)) {
-      trajectoryCacheBuilding = false;
-      trajectoryCacheValid = false;
-      state.trajectoryPreparing = false;
-      robotCommsSendError("trajectory point violates joint limits");
-      return;
-    }
-
-    trajectoryCache[cacheBuildIndex] = target;
-    if (cacheBuildIndex == 0) {
-      trajectoryDistance[cacheBuildIndex] = 0.0f;
-    } else {
-      trajectoryTotalDistance += jointDistance(
-        trajectoryCache[cacheBuildIndex - 1], target);
-      trajectoryDistance[cacheBuildIndex] = trajectoryTotalDistance;
-    }
-    ++cacheBuildIndex;
-    ++calculatedPoints;
+// Mỗi tick đúng 1 lần IK. Điểm cuối xong thì hậu xử lý (tính thời gian + profile)
+// rồi chuyển sang seek.
+void buildStep(RobotControlState &state) {
+  const float t = (float)buildIndex / (float)(buildCount - 1);
+  const CartesianPoint p = lerpPoint(requestedPointA, requestedPointB, t);
+  Joint j;
+  if (!solvePoint(p, j)) {
+    failMotion(state, "trajectory contains an unreachable or forbidden point");
+    return;
   }
-
-  if (cacheBuildIndex > trajectoryPointCount) {
-    cachedPointA = requestedPointA;
-    cachedPointB = requestedPointB;
-    trajectoryCacheValid = true;
-    trajectoryCacheBuilding = false;
-    const JointTarget current = {
-      quantizeJointAngle(state.servo1Angle),
-      quantizeJointAngle(state.servo2Angle),
-      quantizeJointAngle(state.measuredStepAngle)
-    };
-    if (!validJointTarget(current) ||
-        !validateJointSegment(current, trajectoryCache[0])) {
-      state.trajectoryPreparing = false;
-      robotCommsSendError("joint move to point A crosses a forbidden angle");
-      return;
-    }
-    startTrajectoryPlayback(state);
+  if (!path.append(j)) {
+    failMotion(state, "trajectory cache capacity exceeded");
+    return;
   }
+  ++buildIndex;
+  if (buildIndex < buildCount) return;
+
+  if (!path.finalize(speedLimits(), MOTION_ACCEL_TIME_S)) {
+    failMotion(state, "trajectory contains an unreachable or forbidden point");
+    return;
+  }
+  cachedPointA = requestedPointA;
+  cachedPointB = requestedPointB;
+  cacheValid = true;
+
+  const Joint current = commandedJoint(state);
+  if (!validateJointSegment(current, path.first())) {
+    mode = Mode::Idle;
+    state.trajectoryPreparing = false;
+    robotCommsSendError("joint move to point A crosses a forbidden angle");
+    return;
+  }
+  beginSeek(state, current, path.first());
 }
 
-JointTarget cachedTargetAtDistance(float distance) {
-  if (distance <= 0.0f) {
-    return trajectoryCache[0];
-  }
-  if (distance >= trajectoryTotalDistance) {
-    return trajectoryCache[trajectoryPointCount];
-  }
-
-  uint16_t lower = 0;
-  uint16_t upper = trajectoryPointCount;
-  while ((uint16_t)(lower + 1) < upper) {
-    const uint16_t middle = lower + (upper - lower) / 2;
-    if (trajectoryDistance[middle] <= distance) {
-      lower = middle;
-    } else {
-      upper = middle;
-    }
-  }
-
-  const float startDistance = trajectoryDistance[lower];
-  const float segmentDistance = trajectoryDistance[upper] - startDistance;
-  const float segmentProgress = segmentDistance > 0.0f
-    ? (distance - startDistance) / segmentDistance : 1.0f;
-  return interpolate(
-    trajectoryCache[lower], trajectoryCache[upper], segmentProgress);
+void applyCommand(RobotControlState &state, const Joint &cmd) {
+  const bool servoChanged = cmd.s1 != state.servo1Angle || cmd.s2 != state.servo2Angle;
+  state.servo1Angle = cmd.s1;
+  state.servo2Angle = cmd.s2;
+  state.stepTargetAngle = cmd.st;
+  if (servoChanged) runPwm(cmd.s1, cmd.s2, 0.0f, 0.0f);
 }
+
+bool motionActive() {
+  return (mode != Mode::Idle && mode != Mode::Building) || manualActive;
 }
+
+void finishTrajectory(RobotControlState &state) {
+  mode = Mode::Idle;
+  state.trajectoryActive = false;
+  state.feedbackActive = false;
+}
+}  // namespace
 
 void robotCommsBegin() {
   Serial.begin(115200);
@@ -598,7 +555,6 @@ void robotCommsBegin() {
 
 void robotCommsPoll(RobotControlState &state) {
   consumeReceivedBytes(state);
-
   const uint32_t nowMs = millis();
   if ((uint32_t)(nowMs - lastTelemetryMs) >= telemetryPeriodMs) {
     lastTelemetryMs = nowMs;
@@ -606,89 +562,162 @@ void robotCommsPoll(RobotControlState &state) {
   }
 }
 
-void robotCommsUpdateControl(RobotControlState &state, float measuredAngleDeg) {
-  if (!isfinite(measuredAngleDeg) || measuredAngleDeg < 0.0f ||
-      measuredAngleDeg >= 360.0f) {
-    if (state.feedbackActive) {
-      updateStepperFeedback(measuredAngleDeg);
-      state.feedbackActive = false;
-      state.trajectoryActive = false;
-      robotCommsSendError("AS5600 feedback lost or outside step limits");
+void robotCommsRunTick(RobotControlState &state) {
+  if (!state.stepperReady) return;
+
+  Joint cmd = commandedJoint(state);
+
+  switch (mode) {
+    case Mode::Building:
+      buildStep(state);
+      break;
+
+    case Mode::Seeking: {
+      motionTimeS += loopDtS;
+      const float x = seekProfile.position(motionTimeS);
+      const float f = seekProfile.L > 0.0f ? x / seekProfile.L : 1.0f;
+      cmd = lerpJoint(seekFrom, seekTo, f);
+      if (motionTimeS >= seekProfile.T) {
+        cmd = seekTo;
+        motionTimeS = 0.0f;
+        mode = Mode::Playing;
+      }
+      break;
     }
-    if (state.trajectoryPreparing) {
-      trajectoryCacheBuilding = false;
-      trajectoryCacheValid = false;
-      state.trajectoryPreparing = false;
-      robotCommsSendError("AS5600 feedback lost while preparing trajectory");
-    }
-    state.measuredStepAngle = NAN;
-    return;
+
+    case Mode::Playing:
+      motionTimeS += loopDtS;
+      cmd = path.sample(motionTimeS, playReverse);
+      if (motionTimeS >= path.duration()) {
+        cmd = playReverse ? path.first() : path.last();
+        settleTicks = 0;
+        mode = Mode::Settling;
+      }
+      break;
+
+    case Mode::Settling:
+      break;
+
+    case Mode::Idle:
+      if (manualActive) {
+        const SpeedLimits lim = speedLimits();
+        tracker[0].update(manualTarget.s1, lim.s1, lim.s1 / MOTION_ACCEL_TIME_S, loopDtS);
+        tracker[1].update(manualTarget.s2, lim.s2, lim.s2 / MOTION_ACCEL_TIME_S, loopDtS);
+        tracker[2].update(manualTarget.st, lim.st, lim.st / MOTION_ACCEL_TIME_S, loopDtS);
+        cmd = { tracker[0].pos, tracker[1].pos, tracker[2].pos };
+        if (tracker[0].settled(manualTarget.s1) && tracker[1].settled(manualTarget.s2) &&
+            tracker[2].settled(manualTarget.st)) {
+          manualActive = false;
+          state.feedbackActive = false;
+        }
+      }
+      break;
   }
+
+  applyCommand(state, cmd);
+  stepperTrack(state.stepTargetAngle);  // tối đa 1 xung, đúng nhịp tick
+}
+
+void robotCommsFeedback(RobotControlState &state, float measuredAngleDeg) {
+  if (!state.stepperReady) return;
+
+  const bool valid = isfinite(measuredAngleDeg) && measuredAngleDeg >= 0.0f &&
+                     measuredAngleDeg < 360.0f;
+  if (!valid) {
+    if (lostTicks < 255) ++lostTicks;
+    if (lostTicks >= AS5600_LOST_TICKS) {
+      state.measuredStepAngle = NAN;
+      if (motionActive()) {
+        failMotion(state, "AS5600 feedback lost or outside step limits");
+      } else if (mode == Mode::Building) {
+        failMotion(state, "AS5600 feedback lost while preparing trajectory");
+      }
+    }
+    return;  // lỗi I2C thoáng qua: giữ giá trị cũ, không hủy chuyển động
+  }
+  lostTicks = 0;
   state.measuredStepAngle = measuredAngleDeg;
-  if (!state.stepperReady) {
+
+  const bool moving = motionActive();
+  if (moving && (measuredAngleDeg < STEPPER_MIN_DEG - STEPPER_LIMIT_MARGIN_DEG ||
+                 measuredAngleDeg > STEPPER_MAX_DEG + STEPPER_LIMIT_MARGIN_DEG)) {
+    failMotion(state, "AS5600 feedback lost or outside step limits");
     return;
   }
 
-  if (trajectoryCacheBuilding) {
-    buildTrajectoryCacheBatch(state);
+  const float err = state.stepTargetAngle - measuredAngleDeg;  // > 0: trục ra đang chậm
+  const float absErr = fabsf(err);
+
+  // Chỉ báo kẹt nếu đã phát đủ xung nhưng AS5600 gần như không thấy trục dịch chuyển.
+  if (moving && mode != Mode::Settling) {
+    if (!isfinite(stallWindowStartAngle)) {
+      stallWindowStartSteps = getStepperSteps();
+      stallWindowStartAngle = measuredAngleDeg;
+      stallWindowTicks = 0;
+      noProgressWindows = 0;
+    } else if (++stallWindowTicks >= STEPPER_STALL_WINDOW_TICKS) {
+      const int32_t stepDelta = getStepperSteps() - stallWindowStartSteps;
+      float measuredDelta = measuredAngleDeg - stallWindowStartAngle;
+      if (measuredDelta > 180.0f) measuredDelta -= 360.0f;
+      else if (measuredDelta < -180.0f) measuredDelta += 360.0f;
+
+      if (abs(stepDelta) >= STEPPER_STALL_MIN_PULSES) {
+        const float directedProgress =
+            measuredDelta * (stepDelta > 0 ? 1.0f : -1.0f);
+        if (directedProgress < STEPPER_STALL_MIN_PROGRESS_DEG) {
+          if (++noProgressWindows >= STEPPER_STALL_NO_PROGRESS_WINDOWS) {
+            failMotion(state, "stepper lost steps or is stalled");
+            return;
+          }
+        } else {
+          noProgressWindows = 0;
+        }
+      } else {
+        noProgressWindows = 0;
+      }
+      stallWindowStartSteps = getStepperSteps();
+      stallWindowStartAngle = measuredAngleDeg;
+      stallWindowTicks = 0;
+    }
+  } else if (mode != Mode::Settling) {
+    stallWindowStartSteps = getStepperSteps();
+    stallWindowStartAngle = measuredAngleDeg;
+    stallWindowTicks = 0;
+    noProgressWindows = 0;
   }
 
-  if (state.trajectoryActive) {
-    JointTarget target;
-    bool targetReady = false;
-    if (trajectoryPhase == 0) {
-      if (trajectoryFrame < trajectorySeekFrames) {
-        ++trajectoryFrame;
-      }
-      target = interpolate(
-        trajectorySeekStart, trajectoryCache[0],
-        (float)trajectoryFrame / trajectorySeekFrames);
-      targetReady = true;
-      if (trajectoryFrame >= trajectorySeekFrames) {
-        trajectoryFrame = 0;
-        trajectoryPhase = 1;
-      }
-    } else if (trajectoryPhase == 1) {
-      if (trajectoryPlaybackFrame < trajectoryPlaybackFrames) {
-        ++trajectoryPlaybackFrame;
-      }
-      const float pathDistance = trajectoryTotalDistance *
-        (float)trajectoryPlaybackFrame / trajectoryPlaybackFrames;
-      target = cachedTargetAtDistance(pathDistance);
-      targetReady = true;
-      if (trajectoryPlaybackFrame >= trajectoryPlaybackFrames) {
-        trajectoryPhase = 2;
+  const bool settledForTrim =
+      mode == Mode::Settling || (mode == Mode::Idle && !manualActive);
+  const bool movingForTrim = motionActive() && mode != Mode::Settling;
+  bool applyTrim = false;
+  if (trimBudget > 0 && settledForTrim &&
+      absErr > STEPPER_SETTLE_DEADBAND_DEG) {
+    applyTrim = true;
+  } else if (trimBudget > 0 && movingForTrim &&
+             absErr > STEPPER_MOVING_TRIM_ERROR_DEG) {
+    if (++movingTrimTicks >= STEPPER_MOVING_TRIM_INTERVAL_TICKS) {
+      movingTrimTicks = 0;
+      applyTrim = true;
+    }
+  } else {
+    movingTrimTicks = 0;
+  }
+  if (applyTrim) {
+    stepperAdjustTrim(err > 0.0f ? 1 : -1);
+    --trimBudget;
+  }
+
+  if (mode == Mode::Settling) {
+    ++settleTicks;
+    if (absErr <= STEPPER_SETTLE_DEADBAND_DEG) {
+      finishTrajectory(state);
+    } else if (settleTicks >= STEPPER_SETTLE_TIMEOUT_TICKS) {
+      if (absErr > STEPPER_STALL_ERROR_DEG) {
+        failMotion(state, "stepper lost steps or is stalled");
+      } else {
+        finishTrajectory(state);
       }
     }
-
-    if (targetReady) {
-      if (!validJointTarget(target) ||
-          !moveToAngleFeedback(target.step)) {
-        stopTrajectory(state);
-        robotCommsSendError("joint target became invalid; motion stopped");
-        return;
-      }
-
-      state.servo1Angle = target.servo1;
-      state.servo2Angle = target.servo2;
-      state.stepTargetAngle = target.step;
-      setStepperRate((float)STEP_RATE_HZ);
-      runPwm(state.servo1Angle, state.servo2Angle, 0.0f, 0.0f);
-    }
-  }
-
-  if (state.feedbackActive &&
-      !updateStepperFeedback(state.measuredStepAngle)) {
-    state.feedbackActive = false;
-    state.trajectoryActive = false;
-    robotCommsSendError("AS5600 feedback lost or outside step limits");
-  }
-  if (state.trajectoryActive && trajectoryPhase == 2 &&
-      fabsf(state.stepTargetAngle - state.measuredStepAngle) <=
-        STEPPER_FEEDBACK_DEADBAND_DEG) {
-    state.trajectoryActive = false;
-    state.feedbackActive = false;
-    setStepperRate(0.0f);
   }
 }
 

@@ -94,10 +94,74 @@
     .hint { margin: 15px 0 0; font-size: .84rem; }
     .unsupported { display: none; margin-top: 18px; color: #ffb36b; }
 
+    .model-card { grid-column: 1 / -1; }
+    .model-heading {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    .model-heading h2 { margin: 0; }
+    .model-heading button { padding: 8px 12px; }
+    .model-canvas-wrap {
+      margin-top: 16px;
+      overflow: hidden;
+      border: 1px solid #293442;
+      border-radius: 12px;
+      background: radial-gradient(ellipse at 50% 45%, #1b2632, #101820 75%);
+    }
+    #robotModel {
+      display: block;
+      width: 100%;
+      height: 390px;
+      touch-action: none;
+      cursor: grab;
+    }
+    #robotModel:active { cursor: grabbing; }
+    .model-legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px 18px;
+      margin-top: 12px;
+      color: #a9b5c5;
+      font-size: .85rem;
+    }
+    .model-legend span { display: inline-flex; align-items: center; gap: 7px; }
+    .legend-dot { width: 10px; height: 10px; border-radius: 50%; }
+    .legend-line { width: 18px; height: 0; border-top: 2px solid; }
+    .legend-line.ideal { border-top-style: dashed; }
+    .model-dimensions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 14px;
+    }
+    .model-dimensions span {
+      padding: 6px 10px;
+      border: 1px solid #344456;
+      border-radius: 999px;
+      color: #c2d2e5;
+      background: #111820;
+      font-size: .82rem;
+      font-variant-numeric: tabular-nums;
+    }
+    .model-analysis {
+      min-height: 1.4em;
+      margin-top: 12px;
+      color: #c2d2e5;
+      font-size: .88rem;
+      font-variant-numeric: tabular-nums;
+    }
+    .model-disclaimer { margin-top: 5px; font-size: .8rem; }
+    #sequencePoints { padding-left: 24px; }
+    #sequencePoints li { margin: 6px 0; color: #c2d2e5; }
+
     @media (max-width: 700px) {
       body { padding: 22px 14px; }
       .layout { grid-template-columns: 1fr; }
       .topbar { align-items: flex-start; flex-direction: column; }
+      .model-card { grid-column: auto; }
+      #robotModel { height: 320px; }
     }
   </style>
 </head>
@@ -119,6 +183,33 @@
   </div>
 
   <main class="layout">
+    <section class="card model-card" aria-labelledby="modelTitle">
+      <div class="model-heading">
+        <h2 id="modelTitle">Mô hình tay máy 3D</h2>
+        <button id="resetModelView" class="secondary" type="button">Đặt lại góc nhìn</button>
+      </div>
+      <div class="model-canvas-wrap">
+        <canvas id="robotModel" aria-label="Mô hình 3D tay máy, kéo để xoay và cuộn để phóng to"></canvas>
+      </div>
+      <div class="model-legend" aria-label="Chú giải mô hình">
+        <span><i class="legend-dot" style="background:#5ba9f5"></i>Khâu L1</span>
+        <span><i class="legend-dot" style="background:#67d6a2"></i>Khâu L2</span>
+        <span><i class="legend-dot" style="background:#ffbd69"></i>Đầu gắp</span>
+        <span><i class="legend-dot" style="background:#f07f8a"></i>Khớp / điểm O</span>
+        <span><i class="legend-dot" style="background:#67d6a2"></i>Chuỗi điểm</span>
+        <span><i class="legend-line ideal" style="border-color:#78b9ff"></i>Đường lý tưởng</span>
+      </div>
+      <div class="model-dimensions" aria-label="Kích thước lấy từ config">
+        <span id="modelL1"></span>
+        <span id="modelL2"></span>
+        <span id="modelD"></span>
+        <span id="modelH"></span>
+        <span id="modelD1"></span>
+        <span id="modelD2"></span>
+      </div>
+      <p class="hint">D là độ lệch từ trục quay O đến trục khớp 1 theo phương −X cục bộ. D2 là độ lệch ngang từ đầu khâu L2; D1 là độ lệch đứng (đầu gắp nằm thấp hơn đầu L2). Kéo mô hình để xoay, cuộn chuột để phóng to.</p>
+    </section>
+
     <section class="card" aria-labelledby="jointTitle">
       <h2 id="jointTitle">Góc khớp</h2>
 
@@ -154,6 +245,7 @@
         <button id="stopButton" class="stop" disabled>Dừng robot</button>
       </div>
       <p class="hint">Góc được tự động gửi khi kéo thanh điều khiển.</p>
+      <p class="hint">Phím điều khiển: Q/W servo 1 (giảm/tăng), A/S servo 2 (giảm/tăng), Z/X trục xoay (giảm/tăng). Mỗi lần nhấn thay đổi 1° với servo và 0,9° với step.</p>
       <p class="hint">
         Giới hạn bổ sung: servo 1 dưới 30° thì servo 2 từ 90° đến servo 1 + 150°;
         servo 1 từ 30°–60° thì servo 2 tự do trong khoảng 90°–180°;
@@ -169,17 +261,17 @@
         <div class="reading"><span>Z (mm)</span><strong id="zValue">—</strong></div>
       </div>
       <p class="hint">Tọa độ được firmware tính bằng FK. Góc step phản hồi AS5600 chỉ được dùng nội bộ, không gửi lên web.</p>
-      <h2>Nội suy hai điểm</h2>
+      <h2>Chuỗi điểm nội suy</h2>
       <div class="actions">
-        <button id="savePointA" class="secondary" disabled>Lưu vị trí hiện tại A</button>
-        <button id="savePointB" class="secondary" disabled>Lưu vị trí hiện tại B</button>
+        <button id="saveSequencePoint" class="secondary" disabled>Lưu điểm hiện tại</button>
+        <button id="resetSequence" class="secondary" disabled>Xóa chuỗi điểm</button>
       </div>
-      <p id="pointAValue" class="hint">Điểm A: chưa lưu</p>
-      <p id="pointBValue" class="hint">Điểm B: chưa lưu</p>
+      <ol id="sequencePoints" class="hint" aria-label="Danh sách điểm đã lưu"></ol>
       <div class="actions">
-        <button id="playTrajectory" disabled>Chạy thử A → B</button>
+        <button id="playForward" disabled>Chạy thuận</button>
+        <button id="playReverse" class="secondary" disabled>Chạy ngược</button>
       </div>
-      <p id="trajectoryStatus" class="hint">Firmware chia đường Cartesian A→B thành 1000 đoạn (1001 điểm gồm hai đầu), tính IK tối đa 4 điểm mỗi vòng loop và lưu cache. Khi chạy, robot phát lại cache; khớp lệch nhiều nhất đi tối đa 0,9° mỗi vòng loop. Nếu bấm chạy lại cùng A/B, cache được tái sử dụng trong RAM.</p>
+      <p id="trajectoryStatus" class="hint">Lưu tối đa 8 điểm vị trí. Khi chạy, robot nội suy lần lượt từng đoạn giữa các điểm và có thể chạy theo thứ tự thuận hoặc ngược.</p>
     </section>
   </main>
 
@@ -187,13 +279,28 @@
     const statusLabel = document.querySelector("#status");
     const connectButton = document.querySelector("#connectButton");
     const stopButton = document.querySelector("#stopButton");
-    const savePointAButton = document.querySelector("#savePointA");
-    const savePointBButton = document.querySelector("#savePointB");
-    const playTrajectoryButton = document.querySelector("#playTrajectory");
+    const saveSequencePointButton = document.querySelector("#saveSequencePoint");
+    const resetSequenceButton = document.querySelector("#resetSequence");
+    const playForwardButton = document.querySelector("#playForward");
+    const playReverseButton = document.querySelector("#playReverse");
     const servo1 = document.querySelector("#servo1");
     const servo2 = document.querySelector("#servo2");
     const stepAngle = document.querySelector("#stepAngle");
+    const modelCanvas = document.querySelector("#robotModel");
+    const modelContext = modelCanvas.getContext("2d");
     const controls = [servo1, servo2, stepAngle];
+    const modelDimensions = { L1: 130, L2: 130, D: 20, H: 88, D1: 0, D2: 0 };
+    const modelDimensionLabels = {
+      L1: document.querySelector("#modelL1"),
+      L2: document.querySelector("#modelL2"),
+      D: document.querySelector("#modelD"),
+      H: document.querySelector("#modelH"),
+      D1: document.querySelector("#modelD1"),
+      D2: document.querySelector("#modelD2")
+    };
+    const modelCamera = { yaw: -0.72, elevation: 0.48, zoom: 1 };
+    let modelYawDeg = null;
+    let modelPointer = null;
     let port = null;
     let reader = null;
     let writer = null;
@@ -203,12 +310,14 @@
     let setCommandTimer = null;
     let lastSetCommandAt = 0;
     let currentPosition = null;
-    let pointA = null;
-    let pointB = null;
+    let sequencePoints = [];
+    let sequencePlayback = null;
     let trajectoryRunning = false;
-    const minimumSetCommandIntervalMs = 50;
-    const pointAStorageKey = "armRobotPointA";
-    const pointBStorageKey = "armRobotPointB";
+    const minimumSetCommandIntervalMs = 20;
+    const sequenceStorageKey = "armRobotSequencePoints";
+    const legacyPointAStorageKey = "armRobotPointA";
+    const legacyPointBStorageKey = "armRobotPointB";
+    const maximumSequencePoints = 8;
     const packetLength = 30;
     const packetMagic = [0x52, 0x42];
     const protocolVersion = 1;
@@ -236,7 +345,9 @@
       14: "Góc đích không hợp lệ, chuyển động đã dừng",
       15: "Tọa độ quỹ đạo không hợp lệ",
       16: "Lệnh nhị phân không xác định",
-      17: "Góc khớp không hợp lệ"
+      17: "Góc khớp không hợp lệ",
+      18: "Stepper bị mất bước hoặc kẹt (AS5600 lệch quá xa so với lệnh)",
+      19: "Quỹ đạo vượt quá dung lượng cache nội suy"
     };
 
     if (!("serial" in navigator)) {
@@ -247,23 +358,6 @@
     function setStatus(message, kind = "idle") {
       statusLabel.textContent = message;
       statusLabel.dataset.kind = kind;
-    }
-
-    function loadSavedPoint(storageKey, labelId, name) {
-      try {
-        const serialized = localStorage.getItem(storageKey);
-        if (!serialized) return null;
-        const point = JSON.parse(serialized);
-        if (![point.x, point.y, point.z].every(Number.isFinite)) {
-          throw new Error("tọa độ lưu không hợp lệ");
-        }
-        document.querySelector(`#${labelId}`).textContent =
-          `Điểm ${name}: ${formatPoint(point)}`;
-        return point;
-      } catch (error) {
-        setStatus(`Không đọc được điểm ${name}: ${error.message}`, "error");
-        return null;
-      }
     }
 
     function updateJointLimits() {
@@ -296,43 +390,362 @@
       document.querySelector("#servo1Value").value = Number(servo1.value).toFixed(0);
       document.querySelector("#servo2Value").value = Number(servo2.value).toFixed(0);
       document.querySelector("#stepValue").value = Number(stepAngle.value).toFixed(1);
+      renderRobotModel();
+    }
+
+    function renderRobotModel() {
+      if (!modelContext) return;
+
+      const bounds = modelCanvas.getBoundingClientRect();
+      if (!bounds.width || !bounds.height) return;
+      const pixelRatio = Math.min(window.devicePixelRatio || 1, 2);
+      const pixelWidth = Math.round(bounds.width * pixelRatio);
+      const pixelHeight = Math.round(bounds.height * pixelRatio);
+      if (modelCanvas.width !== pixelWidth || modelCanvas.height !== pixelHeight) {
+        modelCanvas.width = pixelWidth;
+        modelCanvas.height = pixelHeight;
+      }
+      modelContext.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
+      const width = bounds.width;
+      const height = bounds.height;
+      modelContext.clearRect(0, 0, width, height);
+
+      const { L1, L2, D, H, D1, D2 } = modelDimensions;
+      const yaw = (modelYawDeg ?? Number(stepAngle.value)) * Math.PI / 180;
+      const angle1 = Number(servo1.value) * Math.PI / 180;
+      const angle2 = Number(servo2.value) * Math.PI / 180;
+      const shoulder = [-D, H];
+      const elbow = [
+        shoulder[0] + L1 * Math.cos(angle1),
+        shoulder[1] + L1 * Math.sin(angle1)
+      ];
+      const wrist = [
+        elbow[0] - L2 * Math.cos(angle2),
+        elbow[1] - L2 * Math.sin(angle2)
+      ];
+      const toolOffset = [wrist[0] + D2, wrist[1] - D1];
+
+      const scale = Math.min(width / 420, height / 300) * 0.98 * modelCamera.zoom;
+      const centerX = width / 2;
+      const centerY = height * 0.59;
+      const cosYaw = Math.cos(yaw);
+      const sinYaw = Math.sin(yaw);
+      const cosCameraYaw = Math.cos(modelCamera.yaw);
+      const sinCameraYaw = Math.sin(modelCamera.yaw);
+      const cosElevation = Math.cos(modelCamera.elevation);
+      const sinElevation = Math.sin(modelCamera.elevation);
+      const focalLength = 1200;
+
+      function project(x, y, z) {
+        const cameraX = x * cosCameraYaw - y * sinCameraYaw;
+        const cameraDepth = x * sinCameraYaw + y * cosCameraYaw;
+        const screenHeight = z * cosElevation - cameraDepth * sinElevation;
+        const depth = z * sinElevation + cameraDepth * cosElevation;
+        const perspective = focalLength / (focalLength + depth);
+        return {
+          x: centerX + cameraX * scale * perspective,
+          y: centerY - (screenHeight - 100 * cosElevation) * scale * perspective,
+          perspective
+        };
+      }
+
+      function point(radial, z) {
+        return project(radial * cosYaw, radial * sinYaw, z);
+      }
+
+      function stroke(points, color, lineWidth, dash = []) {
+        if (!points.length) return;
+        modelContext.beginPath();
+        modelContext.setLineDash(dash);
+        modelContext.moveTo(points[0].x, points[0].y);
+        for (let index = 1; index < points.length; index += 1) {
+          modelContext.lineTo(points[index].x, points[index].y);
+        }
+        modelContext.strokeStyle = color;
+        modelContext.lineWidth = lineWidth;
+        modelContext.lineCap = "round";
+        modelContext.lineJoin = "round";
+        modelContext.stroke();
+        modelContext.setLineDash([]);
+      }
+
+      function ring(radius, z, color, fill = null) {
+        const points = [];
+        for (let index = 0; index <= 48; index += 1) {
+          const angle = index * Math.PI * 2 / 48;
+          points.push(project(radius * Math.cos(angle), radius * Math.sin(angle), z));
+        }
+        modelContext.beginPath();
+        modelContext.moveTo(points[0].x, points[0].y);
+        points.slice(1).forEach(item => modelContext.lineTo(item.x, item.y));
+        if (fill) {
+          modelContext.closePath();
+          modelContext.fillStyle = fill;
+          modelContext.fill();
+        }
+        modelContext.strokeStyle = color;
+        modelContext.lineWidth = 1.5;
+        modelContext.stroke();
+      }
+
+      function joint(item, label, color = "#f07f8a", labelOffsetX = 9, labelOffsetY = -8) {
+        modelContext.beginPath();
+        modelContext.arc(item.x, item.y, Math.max(5, 6 * item.perspective), 0, Math.PI * 2);
+        modelContext.fillStyle = color;
+        modelContext.fill();
+        modelContext.lineWidth = 2;
+        modelContext.strokeStyle = "#101820";
+        modelContext.stroke();
+        modelContext.font = "12px Segoe UI, sans-serif";
+        modelContext.fillStyle = "#d9e4ef";
+        modelContext.fillText(label, item.x + labelOffsetX, item.y + labelOffsetY);
+      }
+
+      function dimension(from, to, label, offsetX = 0, offsetY = 0) {
+        stroke([from, to], "#c3ceda", 1.2, [4, 4]);
+        modelContext.font = "12px Segoe UI, sans-serif";
+        modelContext.fillStyle = "#e5edf6";
+        modelContext.fillText(
+          label,
+          (from.x + to.x) / 2 + offsetX,
+          (from.y + to.y) / 2 + offsetY
+        );
+      }
+
+      function drawMarker(position, label, color) {
+        const item = project(position.x, position.y, position.z);
+        modelContext.beginPath();
+        modelContext.arc(item.x, item.y, 7, 0, Math.PI * 2);
+        modelContext.fillStyle = color;
+        modelContext.fill();
+        modelContext.lineWidth = 2;
+        modelContext.strokeStyle = "#101820";
+        modelContext.stroke();
+        modelContext.font = "bold 13px Segoe UI, sans-serif";
+        modelContext.fillStyle = "#f1f5f9";
+        modelContext.fillText(label, item.x + 10, item.y - 8);
+      }
+
+      function drawPath(points, color, lineWidth, dash) {
+        if (points.length < 2) return;
+        stroke(points.map(item => project(item.x, item.y, item.z)), color, lineWidth, dash);
+      }
+
+      if (sequencePoints.length > 1) {
+        drawPath(sequencePoints, "#78b9ff", 3, [8, 6]);
+      }
+
+      ring(31, 0, "#6e7e8f", "#344354");
+      ring(31, 15, "#76889b", "#263442");
+      stroke([project(0, 0, 0), project(0, 0, H)], "#8999aa", 13);
+      stroke([project(0, 0, H), point(-D, H)], "#a5b3c1", 11);
+      ring(24, H, "#77899b", "#344354");
+
+      const origin = project(0, 0, 0);
+      const originTop = project(0, 0, H);
+      const shoulderPoint = point(shoulder[0], shoulder[1]);
+      const elbowPoint = point(elbow[0], elbow[1]);
+      const wristPoint = point(wrist[0], wrist[1]);
+      const toolPoint = point(toolOffset[0], toolOffset[1]);
+
+      stroke([shoulderPoint, elbowPoint], "#315e8a", 15);
+      stroke([shoulderPoint, elbowPoint], "#5ba9f5", 10);
+      stroke([elbowPoint, wristPoint], "#32765d", 13);
+      stroke([elbowPoint, wristPoint], "#67d6a2", 8);
+      if (D1 !== 0 || D2 !== 0) {
+        const horizontalToolEnd = point(wrist[0] + D2, wrist[1]);
+        stroke([wristPoint, horizontalToolEnd, toolPoint], "#b87432", 7);
+        stroke([wristPoint, horizontalToolEnd, toolPoint], "#ffbd69", 4);
+      }
+      const tangentX = -Math.sin(yaw) * 8;
+      const tangentY = Math.cos(yaw) * 8;
+      stroke([
+        project(toolOffset[0] * cosYaw + tangentX, toolOffset[0] * sinYaw + tangentY, toolOffset[1] + 5),
+        project(toolOffset[0] * cosYaw - tangentX, toolOffset[0] * sinYaw - tangentY, toolOffset[1] - 5)
+      ], "#ffbd69", 4);
+
+      const xAxis = project(65, 0, 0);
+      const yAxis = project(0, 65, 0);
+      const zAxis = project(0, 0, 65);
+      stroke([origin, xAxis], "#df747e", 2);
+      stroke([origin, yAxis], "#74b78a", 2);
+      const zNegativeAxis = project(0, 0, -55);
+      stroke([zNegativeAxis, origin], "#72aef0", 2, [4, 4]);
+      stroke([origin, zAxis], "#72aef0", 3);
+      const arrowAngle = Math.atan2(zAxis.y - origin.y, zAxis.x - origin.x);
+      const arrowLength = 10;
+      modelContext.beginPath();
+      modelContext.moveTo(zAxis.x, zAxis.y);
+      modelContext.lineTo(
+        zAxis.x - arrowLength * Math.cos(arrowAngle - Math.PI / 6),
+        zAxis.y - arrowLength * Math.sin(arrowAngle - Math.PI / 6)
+      );
+      modelContext.lineTo(
+        zAxis.x - arrowLength * Math.cos(arrowAngle + Math.PI / 6),
+        zAxis.y - arrowLength * Math.sin(arrowAngle + Math.PI / 6)
+      );
+      modelContext.closePath();
+      modelContext.fillStyle = "#72aef0";
+      modelContext.fill();
+      modelContext.font = "12px Segoe UI, sans-serif";
+      modelContext.fillStyle = "#e1e8f0";
+      modelContext.fillText("X", xAxis.x + 4, xAxis.y);
+      modelContext.fillText("Y", yAxis.x + 4, yAxis.y);
+      modelContext.font = "bold 12px Segoe UI, sans-serif";
+      modelContext.fillText("+Z ↑", zAxis.x + 5, zAxis.y - 2);
+      modelContext.font = "11px Segoe UI, sans-serif";
+      modelContext.fillStyle = "#9bbce5";
+      modelContext.fillText("−Z", zNegativeAxis.x + 5, zNegativeAxis.y + 4);
+
+      joint(origin, "O");
+      joint(shoulderPoint, "J1");
+      joint(elbowPoint, "J2");
+      if (Math.hypot(wristPoint.x - toolPoint.x, wristPoint.y - toolPoint.y) < 3) {
+        joint(wristPoint, "L2-end / Tool", "#ffbd69", 9, 15);
+      } else {
+        joint(wristPoint, "L2-end", "#f07f8a", 9, 15);
+        joint(toolPoint, "Tool", "#ffbd69");
+      }
+      dimension(originTop, shoulderPoint, "D", 18, -14);
+      dimension(origin, originTop, "H", -35, 0);
+      modelContext.font = "12px Segoe UI, sans-serif";
+      modelContext.fillStyle = "#dce6f0";
+      modelContext.fillText("L1", (shoulderPoint.x + elbowPoint.x) / 2 + 5, (shoulderPoint.y + elbowPoint.y) / 2 - 10);
+      modelContext.fillText("L2", (elbowPoint.x + wristPoint.x) / 2 + 5, (elbowPoint.y + wristPoint.y) / 2 - 10);
+      if (D1 !== 0 || D2 !== 0) {
+        modelContext.fillText("D1 / D2", toolPoint.x + 9, toolPoint.y + 18);
+      }
+      sequencePoints.forEach((item, index) => {
+        drawMarker(item, String(index + 1), index === 0 ? "#67d6a2" : "#c792ea");
+      });
+
+      const compassX = 34;
+      const compassY = height - 36;
+      stroke([{ x: compassX, y: compassY + 17 }, { x: compassX, y: compassY - 25 }], "#72aef0", 3);
+      modelContext.beginPath();
+      modelContext.moveTo(compassX, compassY - 25);
+      modelContext.lineTo(compassX - 6, compassY - 14);
+      modelContext.lineTo(compassX + 6, compassY - 14);
+      modelContext.closePath();
+      modelContext.fillStyle = "#72aef0";
+      modelContext.fill();
+      stroke([{ x: compassX, y: compassY + 17 }, { x: compassX, y: compassY + 34 }], "#9bbce5", 2, [3, 3]);
+      modelContext.font = "bold 11px Segoe UI, sans-serif";
+      modelContext.fillStyle = "#dce9f8";
+      modelContext.fillText("+Z / UP", compassX + 10, compassY - 18);
+      modelContext.font = "10px Segoe UI, sans-serif";
+      modelContext.fillStyle = "#9bbce5";
+      modelContext.fillText("−Z / DOWN", compassX + 10, compassY + 29);
     }
 
     function updateTrajectoryButtons() {
-      const canSave = Boolean(writer && currentPosition && !trajectoryRunning);
-      savePointAButton.disabled = !canSave;
-      savePointBButton.disabled = !canSave;
-      playTrajectoryButton.disabled =
-        !writer || !pointA || !pointB || trajectoryRunning;
+      const playbackActive = Boolean(sequencePlayback);
+      const motionBusy = trajectoryRunning || playbackActive;
+      saveSequencePointButton.disabled =
+        !writer || !currentPosition || sequencePoints.length >= maximumSequencePoints || motionBusy;
+      resetSequenceButton.disabled =
+        sequencePoints.length === 0 || motionBusy;
+      playForwardButton.disabled =
+        !writer || sequencePoints.length < 2 || motionBusy;
+      playReverseButton.disabled =
+        !writer || sequencePoints.length < 2 || motionBusy;
     }
 
     function formatPoint(point) {
       return `X ${point.x.toFixed(1)}, Y ${point.y.toFixed(1)}, Z ${point.z.toFixed(1)} mm`;
     }
 
-    function saveCurrentPoint(name) {
-      if (!currentPosition || trajectoryRunning) return;
-      const point = { ...currentPosition };
-      if (name === "A") {
-        pointA = point;
-        document.querySelector("#pointAValue").textContent =
-          `Điểm A: ${formatPoint(point)}`;
-        try {
-          localStorage.setItem(pointAStorageKey, JSON.stringify(point));
-        } catch (error) {
-          setStatus(`Không lưu được điểm A vào trình duyệt: ${error.message}`, "error");
+    function renderSequencePoints() {
+      const list = document.querySelector("#sequencePoints");
+      list.replaceChildren();
+      sequencePoints.forEach((point, index) => {
+        const item = document.createElement("li");
+        item.textContent = formatPoint(point);
+        item.setAttribute("aria-label", `Điểm ${index + 1}: ${formatPoint(point)}`);
+        list.append(item);
+      });
+    }
+
+    function parseSequencePoint(value) {
+      if (!value || ![value.x, value.y, value.z].every(Number.isFinite)) {
+        throw new Error("tọa độ điểm lưu không hợp lệ");
+      }
+      return { x: value.x, y: value.y, z: value.z };
+    }
+
+    function loadSequencePoints() {
+      let migratedLegacyPoints = false;
+      try {
+        const saved = localStorage.getItem(sequenceStorageKey);
+        if (saved !== null) {
+          const parsed = JSON.parse(saved);
+          if (!Array.isArray(parsed) || parsed.length > maximumSequencePoints) {
+            throw new Error("danh sách phải là mảng có tối đa 8 điểm");
+          }
+          sequencePoints = parsed.map(parseSequencePoint);
+        } else {
+          const legacyPoints = [];
+          const oldA = localStorage.getItem(legacyPointAStorageKey);
+          const oldB = localStorage.getItem(legacyPointBStorageKey);
+          if (oldA !== null) legacyPoints.push(parseSequencePoint(JSON.parse(oldA)));
+          if (oldB !== null) legacyPoints.push(parseSequencePoint(JSON.parse(oldB)));
+          sequencePoints = legacyPoints;
+          migratedLegacyPoints = legacyPoints.length > 0;
         }
-      } else {
-        pointB = point;
-        document.querySelector("#pointBValue").textContent =
-          `Điểm B: ${formatPoint(point)}`;
+      } catch (error) {
+        sequencePoints = [];
+        setStatus(`Không đọc được chuỗi điểm đã lưu: ${error.message}`, "error");
+        renderSequencePoints();
+        return;
+      }
+      if (migratedLegacyPoints) {
         try {
-          localStorage.setItem(pointBStorageKey, JSON.stringify(point));
+          localStorage.setItem(sequenceStorageKey, JSON.stringify(sequencePoints));
         } catch (error) {
-          setStatus(`Không lưu được điểm B vào trình duyệt: ${error.message}`, "error");
+          setStatus(`Không thể nâng cấp chuỗi điểm đã lưu: ${error.message}`, "error");
         }
       }
+      renderSequencePoints();
+    }
+
+    function saveCurrentSequencePoint() {
+      if (!currentPosition || !writer || sequencePlayback ||
+          trajectoryRunning || sequencePoints.length >= maximumSequencePoints) return;
+      sequencePoints.push({ ...currentPosition });
+      try {
+        localStorage.setItem(sequenceStorageKey, JSON.stringify(sequencePoints));
+      } catch (error) {
+        sequencePoints.pop();
+        setStatus(`Không lưu được điểm vào trình duyệt: ${error.message}`, "error");
+        renderSequencePoints();
+        renderRobotModel();
+        updateTrajectoryButtons();
+        return;
+      }
+      renderSequencePoints();
+      renderRobotModel();
       updateTrajectoryButtons();
+      document.querySelector("#trajectoryStatus").textContent =
+        `Đã lưu ${sequencePoints.length}/${maximumSequencePoints} điểm.`;
+    }
+
+    function resetSequencePoints() {
+      if (sequencePlayback || trajectoryRunning || sequencePoints.length === 0) return;
+      try {
+        localStorage.removeItem(sequenceStorageKey);
+        localStorage.removeItem(legacyPointAStorageKey);
+        localStorage.removeItem(legacyPointBStorageKey);
+      } catch (error) {
+        setStatus(`Không xóa được chuỗi điểm đã lưu: ${error.message}`, "error");
+        return;
+      }
+      sequencePoints = [];
+      renderSequencePoints();
+      renderRobotModel();
+      updateTrajectoryButtons();
+      document.querySelector("#trajectoryStatus").textContent =
+        "Đã xóa chuỗi điểm. Có thể lưu tối đa 8 điểm mới.";
+      setStatus("Đã xóa chuỗi điểm đã lưu", "ok");
     }
 
     function displayNumber(id, value, decimals = 2) {
@@ -340,6 +753,67 @@
         typeof value === "number" && Number.isFinite(value)
           ? value.toFixed(decimals)
           : "—";
+    }
+
+    function finishSequencePlayback(message, kind = "ok") {
+      sequencePlayback = null;
+      trajectoryRunning = false;
+      controls.forEach(control => {
+        control.disabled = !writer;
+      });
+      updateTrajectoryButtons();
+      renderRobotModel();
+      document.querySelector("#trajectoryStatus").textContent = message;
+      setStatus(message, kind);
+    }
+
+    async function sendSequenceSegment() {
+      if (!sequencePlayback || !writer) return;
+      const { points, direction, segmentIndex } = sequencePlayback;
+      if (segmentIndex >= points.length - 1) {
+        finishSequencePlayback(
+          `Đã chạy hết ${points.length} điểm theo hướng ${direction > 0 ? "thuận" : "ngược"}.`
+        );
+        return;
+      }
+
+      const fromIndex = direction > 0
+        ? segmentIndex
+        : points.length - 1 - segmentIndex;
+      const toIndex = fromIndex + direction;
+      const from = points[fromIndex];
+      const to = points[toIndex];
+      sequencePlayback.segmentStarted = false;
+      trajectoryRunning = true;
+      controls.forEach(control => { control.disabled = true; });
+      updateTrajectoryButtons();
+      document.querySelector("#trajectoryStatus").textContent =
+        `Đang chạy đoạn ${segmentIndex + 1}/${points.length - 1}: điểm ${fromIndex + 1} → ${toIndex + 1}.`;
+      try {
+        await sendCommand(commandTypes.playTrajectory, [
+          from.x, from.y, from.z,
+          to.x, to.y, to.z
+        ]);
+      } catch (error) {
+        finishSequencePlayback(`Gửi lệnh quỹ đạo thất bại: ${error.message}`, "error");
+      }
+    }
+
+    function startSequencePlayback(direction) {
+      if (!writer || sequencePoints.length < 2 || trajectoryRunning || sequencePlayback) return;
+      if (setCommandTimer !== null) {
+        clearTimeout(setCommandTimer);
+        setCommandTimer = null;
+      }
+      pendingSetCommand = false;
+      sequencePlayback = {
+        points: sequencePoints.map(point => ({ ...point })),
+        direction,
+        segmentIndex: 0,
+        segmentStarted: false
+      };
+      renderRobotModel();
+      sendSequenceSegment();
     }
 
     function handleMessage(data) {
@@ -350,13 +824,39 @@
         if (Number.isFinite(data.x) && Number.isFinite(data.y) &&
             Number.isFinite(data.z)) {
           currentPosition = { x: data.x, y: data.y, z: data.z };
+          const planarRadius = -modelDimensions.D +
+            modelDimensions.L1 * Math.cos(Number(data.s1) * Math.PI / 180) -
+            modelDimensions.L2 * Math.cos(Number(data.s2) * Math.PI / 180) +
+            modelDimensions.D2;
+          if (Math.hypot(data.x, data.y) > 10 && Number.isFinite(planarRadius)) {
+            const radialDirection = planarRadius < 0 ? 180 : 0;
+            modelYawDeg =
+              (Math.atan2(data.y, data.x) * 180 / Math.PI) - radialDirection;
+          }
         }
-        const wasPreparing = trajectoryRunning;
-        trajectoryRunning =
+        const wasRunning = trajectoryRunning;
+        const nextTrajectoryRunning =
           data.trajectory === true || data.preparing === true;
-        if (trajectoryRunning) controlsDirty = false;
+        let sequenceFinished = false;
+        trajectoryRunning = nextTrajectoryRunning;
+        if (sequencePlayback) {
+          if (nextTrajectoryRunning) {
+            sequencePlayback.segmentStarted = true;
+          } else if (wasRunning && sequencePlayback.segmentStarted) {
+            sequencePlayback.segmentIndex += 1;
+            if (sequencePlayback.segmentIndex >= sequencePlayback.points.length - 1) {
+              finishSequencePlayback(
+                `Đã chạy hết ${sequencePlayback.points.length} điểm theo hướng ${sequencePlayback.direction > 0 ? "thuận" : "ngược"}.`
+              );
+              sequenceFinished = true;
+            } else {
+              sendSequenceSegment();
+            }
+          }
+        }
+        if (trajectoryRunning || sequencePlayback) controlsDirty = false;
         controls.forEach(control => {
-          control.disabled = !writer || trajectoryRunning;
+          control.disabled = !writer || trajectoryRunning || Boolean(sequencePlayback);
         });
         updateTrajectoryButtons();
         if (data.preparing === true) {
@@ -365,30 +865,44 @@
             : 0;
           document.querySelector("#trajectoryStatus").textContent =
             `Đang tính IK và tạo cache đường đi: ${progress}%`;
-        } else if (data.trajectory === true && wasPreparing) {
+        } else if (data.trajectory === true && wasRunning && !sequencePlayback) {
           document.querySelector("#trajectoryStatus").textContent =
-            "Đã tạo cache. Robot đang chạy theo đường thẳng A → B.";
+            "Đã tạo cache. Robot đang chạy theo đường thẳng.";
+        } else if (!trajectoryRunning && wasRunning && !sequencePlayback &&
+                   !sequenceFinished) {
+          document.querySelector("#trajectoryStatus").textContent =
+            "Quỹ đạo đã kết thúc.";
         }
         if (!controlsDirty) {
           if (Number.isFinite(data.s1)) servo1.value = String(data.s1);
           if (Number.isFinite(data.s2)) servo2.value = String(data.s2);
           updateLabels();
+        } else {
+          renderRobotModel();
         }
       } else if (data.type === "ack" && !data.ok) {
+        sequencePlayback = null;
         trajectoryRunning = false;
+        renderRobotModel();
         controls.forEach(control => {
           control.disabled = !writer;
         });
         updateTrajectoryButtons();
         setStatus(data.error || "Robot từ chối lệnh", "error");
       } else if (data.type === "error") {
+        sequencePlayback = null;
         trajectoryRunning = false;
+        renderRobotModel();
         controls.forEach(control => {
           control.disabled = !writer;
         });
         updateTrajectoryButtons();
         setStatus(data.message || "Lỗi từ robot", "error");
       } else if (data.type === "ack" && data.ok) {
+        if (sequencePlayback) {
+          sequencePlayback.segmentStarted = true;
+          trajectoryRunning = true;
+        }
         if (data.preparing === true) {
           trajectoryRunning = true;
           controls.forEach(control => {
@@ -396,9 +910,10 @@
           });
           updateTrajectoryButtons();
           document.querySelector("#trajectoryStatus").textContent =
-            "Đang tính IK cho 1001 điểm (4 điểm mỗi vòng loop)...";
+            "Đang tính IK và chia nhỏ quỹ đạo thành các bước góc tối đa 0,45°...";
           setStatus("Đang chuẩn bị cache quỹ đạo", "idle");
         } else if (Number.isFinite(data.segmentMs)) {
+          trajectoryRunning = true;
           document.querySelector("#trajectoryStatus").textContent =
             `Phát lại cache quỹ đạo. Thời lượng ước tính: ${(data.segmentMs / 1000).toFixed(2)} giây.`;
           setStatus("Đã bắt đầu phát lại quỹ đạo", "ok");
@@ -569,6 +1084,8 @@
     async function disconnect() {
       const activePort = port;
       port = null;
+      sequencePlayback = null;
+      trajectoryRunning = false;
       receiveBuffer = new Uint8Array(0);
       if (setCommandTimer !== null) {
         clearTimeout(setCommandTimer);
@@ -644,12 +1161,81 @@
     for (const control of controls) {
       control.addEventListener("input", () => {
         controlsDirty = true;
+        if (control === stepAngle) modelYawDeg = null;
         updateLabels();
         scheduleSetCommand();
       });
     }
 
+    modelCanvas.addEventListener("pointerdown", event => {
+      modelPointer = { id: event.pointerId, x: event.clientX, y: event.clientY };
+      modelCanvas.setPointerCapture(event.pointerId);
+    });
+    modelCanvas.addEventListener("pointermove", event => {
+      if (!modelPointer || modelPointer.id !== event.pointerId) return;
+      modelCamera.yaw += (event.clientX - modelPointer.x) * 0.008;
+      modelCamera.elevation = Math.max(
+        -0.15,
+        Math.min(1.25, modelCamera.elevation + (event.clientY - modelPointer.y) * 0.006)
+      );
+      modelPointer.x = event.clientX;
+      modelPointer.y = event.clientY;
+      renderRobotModel();
+    });
+    modelCanvas.addEventListener("pointerup", () => { modelPointer = null; });
+    modelCanvas.addEventListener("pointercancel", () => { modelPointer = null; });
+    modelCanvas.addEventListener("wheel", event => {
+      event.preventDefault();
+      modelCamera.zoom = Math.max(
+        0.55,
+        Math.min(2.5, modelCamera.zoom * (event.deltaY < 0 ? 1.1 : 0.9))
+      );
+      renderRobotModel();
+    }, { passive: false });
+    document.querySelector("#resetModelView").addEventListener("click", () => {
+      modelCamera.yaw = -0.72;
+      modelCamera.elevation = 0.48;
+      modelCamera.zoom = 1;
+      renderRobotModel();
+    });
+    window.addEventListener("resize", renderRobotModel);
+
+    document.addEventListener("keydown", event => {
+      if (!writer || trajectoryRunning || sequencePlayback || event.altKey || event.ctrlKey ||
+          event.metaKey) {
+        return;
+      }
+
+      const activeElement = document.activeElement;
+      if (activeElement?.isContentEditable ||
+          (activeElement instanceof HTMLElement &&
+           activeElement.matches("input:not([type=range]), textarea, select"))) {
+        return;
+      }
+
+      const key = event.key.toLowerCase();
+      const keyBindings = {
+        q: [servo1, 1],
+        w: [servo1, -1],
+        a: [servo2, 1],
+        s: [servo2, -1],
+        z: [stepAngle, 0.9],
+        x: [stepAngle, -0.9]
+      };
+      const binding = keyBindings[key];
+      if (!binding) return;
+
+      event.preventDefault();
+      const [control, delta] = binding;
+      const minimum = Number(control.min);
+      const maximum = Number(control.max);
+      const current = Number(control.value);
+      control.value = String(Math.min(maximum, Math.max(minimum, current + delta)));
+      control.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+
     stopButton.addEventListener("click", async () => {
+      sequencePlayback = null;
       if (setCommandTimer !== null) {
         clearTimeout(setCommandTimer);
         setCommandTimer = null;
@@ -657,42 +1243,23 @@
       pendingSetCommand = false;
       try {
         await sendCommand(commandTypes.stop);
+        updateTrajectoryButtons();
         setStatus("Đã gửi lệnh dừng", "idle");
       } catch (error) {
         setStatus(`Gửi UART thất bại: ${error.message}`, "error");
       }
     });
 
-    savePointAButton.addEventListener("click", () => saveCurrentPoint("A"));
-    savePointBButton.addEventListener("click", () => saveCurrentPoint("B"));
+    saveSequencePointButton.addEventListener("click", saveCurrentSequencePoint);
+    resetSequenceButton.addEventListener("click", resetSequencePoints);
+    playForwardButton.addEventListener("click", () => startSequencePlayback(1));
+    playReverseButton.addEventListener("click", () => startSequencePlayback(-1));
 
-    playTrajectoryButton.addEventListener("click", async () => {
-      if (!writer || !pointA || !pointB || trajectoryRunning) return;
-
-      if (setCommandTimer !== null) {
-        clearTimeout(setCommandTimer);
-        setCommandTimer = null;
-      }
-      pendingSetCommand = false;
-      trajectoryRunning = true;
-      controls.forEach(control => control.disabled = true);
-      updateTrajectoryButtons();
-      try {
-        await sendCommand(commandTypes.playTrajectory, [
-          pointA.x, pointA.y, pointA.z,
-          pointB.x, pointB.y, pointB.z
-        ]);
-        setStatus("Đang bắt đầu nội suy A → B...", "idle");
-      } catch (error) {
-        trajectoryRunning = false;
-        controls.forEach(control => control.disabled = false);
-        updateTrajectoryButtons();
-        setStatus(`Gửi UART thất bại: ${error.message}`, "error");
-      }
+    Object.keys(modelDimensions).forEach(name => {
+      modelDimensionLabels[name].textContent = name;
     });
-
-    pointA = loadSavedPoint(pointAStorageKey, "pointAValue", "A");
-    pointB = loadSavedPoint(pointBStorageKey, "pointBValue", "B");
+    updateLabels();
+    loadSequencePoints();
     updateLabels();
     updateTrajectoryButtons();
   </script>
