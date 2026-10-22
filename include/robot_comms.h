@@ -5,6 +5,8 @@ struct RobotControlState {
   float servo2Angle;        // góc lệnh servo 2
   float stepTargetAngle;    // góc lệnh stepper (liên tục, chưa làm tròn xung)
   float measuredStepAngle;  // góc đo bằng AS5600 (trục ra)
+  float wristAngle;         // góc lệnh cổ tay (0-180)
+  float gripperAngle;       // góc lệnh tay kẹp (0-180)
   bool stepperReady;
   bool feedbackActive;      // đang có chuyển động được giám sát
   bool trajectoryActive;    // đang seek / chạy / chờ ổn định của quỹ đạo A-B

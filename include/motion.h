@@ -37,7 +37,7 @@ struct Profile {
 class Trajectory {
  public:
   static constexpr uint16_t kMaxInputPoints = 513;
-  static constexpr uint16_t kMaxPoints = 4097;
+  static constexpr uint16_t kMaxPoints = 800;
   static constexpr float kMaxJointDeltaDeg = 0.45f;
 
   void clear();

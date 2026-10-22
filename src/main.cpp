@@ -16,6 +16,8 @@ RobotControlState robotState = {
   120.0f,  // servo2
   180.0f,  // step target
   NAN,     // measured
+  90.0f,   // wrist
+  0.0f,    // gripper
   false, false, false, false
 };
 uint32_t nextTickUs = 0;
@@ -40,7 +42,7 @@ void setup() {
   digitalWrite(2, HIGH);
   asInit();
   pwmInit();
-  runPwm(robotState.servo1Angle, robotState.servo2Angle, 0.0f, 0.0f);
+  runPwm(robotState.servo1Angle, robotState.servo2Angle, robotState.wristAngle, robotState.gripperAngle);
 
   robotState.stepperReady = stepInit();
   enableStep(true);

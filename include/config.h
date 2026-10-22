@@ -64,6 +64,15 @@ constexpr float STEPPER_MAX_SPEED_DEG_PER_SEC =
 #define STEPPER_MIN_DEG 60.0f
 #define STEPPER_MAX_DEG 300.0f
 
+#define WRIST_MIN_DEG 0.0f
+#define WRIST_MAX_DEG 180.0f
+#define GRIPPER_MIN_DEG 0.0f
+#define GRIPPER_MAX_DEG 180.0f
+
+// Thời gian chờ ổn định khi xoay cổ tay và đóng/mở kẹp tại điểm đích (ms)
+#define WRIST_SETTLE_MS 500
+#define GRIPPER_SETTLE_MS 500
+
 // define length of arm, mm, deg, s
 #define L1 130
 #define L2 130

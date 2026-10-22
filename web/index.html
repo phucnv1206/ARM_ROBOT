@@ -240,12 +240,30 @@
         <div class="range-note">Giới hạn: 60°–300°, phản hồi AS5600 xử lý nội bộ</div>
       </div>
 
+      <div class="control">
+        <div class="control-heading">
+          <label for="wrist">Cổ tay (Wrist)</label>
+          <span class="value"><output id="wristValue">90</output>°</span>
+        </div>
+        <input id="wrist" type="range" min="0" max="180" step="1" value="90" disabled>
+        <div class="range-note">Giới hạn: 0°–180° (phím E/R)</div>
+      </div>
+
+      <div class="control">
+        <div class="control-heading">
+          <label for="gripper">Tay gắp (Gripper)</label>
+          <span class="value"><output id="gripperValue">0</output>°</span>
+        </div>
+        <input id="gripper" type="range" min="0" max="180" step="1" value="0" disabled>
+        <div class="range-note">Giới hạn: 0°–180° (phím D/F)</div>
+      </div>
+
       <div id="jointCondition" class="range-note"></div>
       <div class="actions">
         <button id="stopButton" class="stop" disabled>Dừng robot</button>
       </div>
       <p class="hint">Góc được tự động gửi khi kéo thanh điều khiển.</p>
-      <p class="hint">Phím điều khiển: Q/W servo 1 (giảm/tăng), A/S servo 2 (giảm/tăng), Z/X trục xoay (giảm/tăng). Mỗi lần nhấn thay đổi 1° với servo và 0,9° với step.</p>
+      <p class="hint">Phím điều khiển: Q/W servo 1, A/S servo 2, Z/X trục xoay, E/R cổ tay (giảm/tăng), D/F tay gắp (giảm/tăng). Mỗi lần nhấn thay đổi 1° (0,9° với step).</p>
       <p class="hint">
         Giới hạn bổ sung: servo 1 dưới 30° thì servo 2 từ 90° đến servo 1 + 150°;
         servo 1 từ 30°–60° thì servo 2 tự do trong khoảng 90°–180°;
@@ -268,10 +286,9 @@
       </div>
       <ol id="sequencePoints" class="hint" aria-label="Danh sách điểm đã lưu"></ol>
       <div class="actions">
-        <button id="playForward" disabled>Chạy thuận</button>
-        <button id="playReverse" class="secondary" disabled>Chạy ngược</button>
+        <button id="playForward" disabled>Chạy chuỗi</button>
       </div>
-      <p id="trajectoryStatus" class="hint">Lưu tối đa 8 điểm vị trí. Khi chạy, robot nội suy lần lượt từng đoạn giữa các điểm và có thể chạy theo thứ tự thuận hoặc ngược.</p>
+      <p id="trajectoryStatus" class="hint">Lưu tối đa 8 điểm vào Flash ESP32 (không mất khi mất điện). Web chỉ gửi lệnh Lưu/Xóa/Play, ESP32 sẽ tự động nội suy và bám theo toàn bộ chuỗi điểm.</p>
     </section>
   </main>
 
@@ -282,13 +299,14 @@
     const saveSequencePointButton = document.querySelector("#saveSequencePoint");
     const resetSequenceButton = document.querySelector("#resetSequence");
     const playForwardButton = document.querySelector("#playForward");
-    const playReverseButton = document.querySelector("#playReverse");
     const servo1 = document.querySelector("#servo1");
     const servo2 = document.querySelector("#servo2");
     const stepAngle = document.querySelector("#stepAngle");
+    const wrist = document.querySelector("#wrist");
+    const gripper = document.querySelector("#gripper");
     const modelCanvas = document.querySelector("#robotModel");
     const modelContext = modelCanvas.getContext("2d");
-    const controls = [servo1, servo2, stepAngle];
+    const controls = [servo1, servo2, stepAngle, wrist, gripper];
     const modelDimensions = { L1: 130, L2: 130, D: 20, H: 88, D1: 0, D2: 0 };
     const modelDimensionLabels = {
       L1: document.querySelector("#modelL1"),
@@ -311,22 +329,22 @@
     let lastSetCommandAt = 0;
     let currentPosition = null;
     let sequencePoints = [];
-    let sequencePlayback = null;
     let trajectoryRunning = false;
     const minimumSetCommandIntervalMs = 20;
-    const sequenceStorageKey = "armRobotSequencePoints";
-    const legacyPointAStorageKey = "armRobotPointA";
-    const legacyPointBStorageKey = "armRobotPointB";
     const maximumSequencePoints = 8;
     const packetLength = 30;
     const packetMagic = [0x52, 0x42];
     const protocolVersion = 1;
-    const packetTypes = { state: 1, ack: 2, error: 3 };
+    const packetTypes = { state: 1, ack: 2, error: 3, sequencePoint: 4 };
     const commandTypes = {
       getState: 16,
       setJoints: 17,
       playTrajectory: 18,
-      stop: 19
+      stop: 19,
+      savePoint: 20,
+      clearPoints: 21,
+      playSequence: 22,
+      getPoints: 23
     };
     const protocolErrors = {
       1: "Lệnh bị từ chối: robot đang chạy hoặc chuẩn bị quỹ đạo",
@@ -347,7 +365,10 @@
       16: "Lệnh nhị phân không xác định",
       17: "Góc khớp không hợp lệ",
       18: "Stepper bị mất bước hoặc kẹt (AS5600 lệch quá xa so với lệnh)",
-      19: "Quỹ đạo vượt quá dung lượng cache nội suy"
+      19: "Quỹ đạo vượt quá dung lượng cache nội suy",
+      20: "Chuỗi điểm trong Flash đã đầy (tối đa 8 điểm)",
+      21: "Cần lưu ít nhất 2 điểm trong Flash để chạy chuỗi",
+      22: "Không thể thực hiện thao tác khi robot đang chuyển động"
     };
 
     if (!("serial" in navigator)) {
@@ -390,6 +411,8 @@
       document.querySelector("#servo1Value").value = Number(servo1.value).toFixed(0);
       document.querySelector("#servo2Value").value = Number(servo2.value).toFixed(0);
       document.querySelector("#stepValue").value = Number(stepAngle.value).toFixed(1);
+      document.querySelector("#wristValue").value = Number(wrist.value).toFixed(0);
+      document.querySelector("#gripperValue").value = Number(gripper.value).toFixed(0);
       renderRobotModel();
     }
 
@@ -639,20 +662,19 @@
     }
 
     function updateTrajectoryButtons() {
-      const playbackActive = Boolean(sequencePlayback);
-      const motionBusy = trajectoryRunning || playbackActive;
+      const motionBusy = trajectoryRunning;
       saveSequencePointButton.disabled =
         !writer || !currentPosition || sequencePoints.length >= maximumSequencePoints || motionBusy;
       resetSequenceButton.disabled =
-        sequencePoints.length === 0 || motionBusy;
+        !writer || sequencePoints.length === 0 || motionBusy;
       playForwardButton.disabled =
-        !writer || sequencePoints.length < 2 || motionBusy;
-      playReverseButton.disabled =
         !writer || sequencePoints.length < 2 || motionBusy;
     }
 
     function formatPoint(point) {
-      return `X ${point.x.toFixed(1)}, Y ${point.y.toFixed(1)}, Z ${point.z.toFixed(1)} mm`;
+      const wristStr = point.wrist !== undefined ? point.wrist.toFixed(0) : "90";
+      const gripStr = point.gripper !== undefined ? point.gripper.toFixed(0) : "0";
+      return `X ${point.x.toFixed(1)}, Y ${point.y.toFixed(1)}, Z ${point.z.toFixed(1)} mm | Cổ tay: ${wristStr}° | Tay gắp: ${gripStr}°`;
     }
 
     function renderSequencePoints() {
@@ -666,86 +688,39 @@
       });
     }
 
-    function parseSequencePoint(value) {
-      if (!value || ![value.x, value.y, value.z].every(Number.isFinite)) {
-        throw new Error("tọa độ điểm lưu không hợp lệ");
+    async function saveCurrentPoint() {
+      if (!writer || trajectoryRunning || sequencePoints.length >= maximumSequencePoints) return;
+      try {
+        await sendCommand(commandTypes.savePoint);
+        setStatus("Đang gửi lệnh lưu điểm vào Flash ESP32...", "idle");
+      } catch (error) {
+        setStatus(`Lưu điểm thất bại: ${error.message}`, "error");
       }
-      return { x: value.x, y: value.y, z: value.z };
     }
 
-    function loadSequencePoints() {
-      let migratedLegacyPoints = false;
+    async function resetPoints() {
+      if (!writer || trajectoryRunning || sequencePoints.length === 0) return;
       try {
-        const saved = localStorage.getItem(sequenceStorageKey);
-        if (saved !== null) {
-          const parsed = JSON.parse(saved);
-          if (!Array.isArray(parsed) || parsed.length > maximumSequencePoints) {
-            throw new Error("danh sách phải là mảng có tối đa 8 điểm");
-          }
-          sequencePoints = parsed.map(parseSequencePoint);
-        } else {
-          const legacyPoints = [];
-          const oldA = localStorage.getItem(legacyPointAStorageKey);
-          const oldB = localStorage.getItem(legacyPointBStorageKey);
-          if (oldA !== null) legacyPoints.push(parseSequencePoint(JSON.parse(oldA)));
-          if (oldB !== null) legacyPoints.push(parseSequencePoint(JSON.parse(oldB)));
-          sequencePoints = legacyPoints;
-          migratedLegacyPoints = legacyPoints.length > 0;
-        }
+        await sendCommand(commandTypes.clearPoints);
+        setStatus("Đang gửi lệnh xóa chuỗi trong Flash ESP32...", "idle");
       } catch (error) {
-        sequencePoints = [];
-        setStatus(`Không đọc được chuỗi điểm đã lưu: ${error.message}`, "error");
-        renderSequencePoints();
-        return;
+        setStatus(`Xóa chuỗi thất bại: ${error.message}`, "error");
       }
-      if (migratedLegacyPoints) {
-        try {
-          localStorage.setItem(sequenceStorageKey, JSON.stringify(sequencePoints));
-        } catch (error) {
-          setStatus(`Không thể nâng cấp chuỗi điểm đã lưu: ${error.message}`, "error");
-        }
-      }
-      renderSequencePoints();
     }
 
-    function saveCurrentSequencePoint() {
-      if (!currentPosition || !writer || sequencePlayback ||
-          trajectoryRunning || sequencePoints.length >= maximumSequencePoints) return;
-      sequencePoints.push({ ...currentPosition });
-      try {
-        localStorage.setItem(sequenceStorageKey, JSON.stringify(sequencePoints));
-      } catch (error) {
-        sequencePoints.pop();
-        setStatus(`Không lưu được điểm vào trình duyệt: ${error.message}`, "error");
-        renderSequencePoints();
-        renderRobotModel();
-        updateTrajectoryButtons();
-        return;
+    async function playSequence() {
+      if (!writer || trajectoryRunning || sequencePoints.length < 2) return;
+      if (setCommandTimer !== null) {
+        clearTimeout(setCommandTimer);
+        setCommandTimer = null;
       }
-      renderSequencePoints();
-      renderRobotModel();
-      updateTrajectoryButtons();
-      document.querySelector("#trajectoryStatus").textContent =
-        `Đã lưu ${sequencePoints.length}/${maximumSequencePoints} điểm.`;
-    }
-
-    function resetSequencePoints() {
-      if (sequencePlayback || trajectoryRunning || sequencePoints.length === 0) return;
+      pendingSetCommand = false;
       try {
-        localStorage.removeItem(sequenceStorageKey);
-        localStorage.removeItem(legacyPointAStorageKey);
-        localStorage.removeItem(legacyPointBStorageKey);
+        await sendCommand(commandTypes.playSequence, [1]);
+        setStatus("Đang yêu cầu ESP32 chạy chuỗi hành động...", "idle");
       } catch (error) {
-        setStatus(`Không xóa được chuỗi điểm đã lưu: ${error.message}`, "error");
-        return;
+        setStatus(`Chạy chuỗi thất bại: ${error.message}`, "error");
       }
-      sequencePoints = [];
-      renderSequencePoints();
-      renderRobotModel();
-      updateTrajectoryButtons();
-      document.querySelector("#trajectoryStatus").textContent =
-        "Đã xóa chuỗi điểm. Có thể lưu tối đa 8 điểm mới.";
-      setStatus("Đã xóa chuỗi điểm đã lưu", "ok");
     }
 
     function displayNumber(id, value, decimals = 2) {
@@ -755,68 +730,28 @@
           : "—";
     }
 
-    function finishSequencePlayback(message, kind = "ok") {
-      sequencePlayback = null;
-      trajectoryRunning = false;
-      controls.forEach(control => {
-        control.disabled = !writer;
-      });
-      updateTrajectoryButtons();
-      renderRobotModel();
-      document.querySelector("#trajectoryStatus").textContent = message;
-      setStatus(message, kind);
-    }
-
-    async function sendSequenceSegment() {
-      if (!sequencePlayback || !writer) return;
-      const { points, direction, segmentIndex } = sequencePlayback;
-      if (segmentIndex >= points.length - 1) {
-        finishSequencePlayback(
-          `Đã chạy hết ${points.length} điểm theo hướng ${direction > 0 ? "thuận" : "ngược"}.`
-        );
+    function handleMessage(data) {
+      if (data.type === "sequencePoint") {
+        if (data.totalCount === 0) {
+          sequencePoints = [];
+        } else {
+          if (data.index === 0) sequencePoints = [];
+          sequencePoints[data.index] = {
+            x: data.x,
+            y: data.y,
+            z: data.z,
+            wrist: data.wrist,
+            gripper: data.gripper
+          };
+        }
+        renderSequencePoints();
+        renderRobotModel();
+        updateTrajectoryButtons();
+        document.querySelector("#trajectoryStatus").textContent =
+          `Đã lưu ${sequencePoints.length}/${maximumSequencePoints} điểm trong Flash ESP32.`;
         return;
       }
 
-      const fromIndex = direction > 0
-        ? segmentIndex
-        : points.length - 1 - segmentIndex;
-      const toIndex = fromIndex + direction;
-      const from = points[fromIndex];
-      const to = points[toIndex];
-      sequencePlayback.segmentStarted = false;
-      trajectoryRunning = true;
-      controls.forEach(control => { control.disabled = true; });
-      updateTrajectoryButtons();
-      document.querySelector("#trajectoryStatus").textContent =
-        `Đang chạy đoạn ${segmentIndex + 1}/${points.length - 1}: điểm ${fromIndex + 1} → ${toIndex + 1}.`;
-      try {
-        await sendCommand(commandTypes.playTrajectory, [
-          from.x, from.y, from.z,
-          to.x, to.y, to.z
-        ]);
-      } catch (error) {
-        finishSequencePlayback(`Gửi lệnh quỹ đạo thất bại: ${error.message}`, "error");
-      }
-    }
-
-    function startSequencePlayback(direction) {
-      if (!writer || sequencePoints.length < 2 || trajectoryRunning || sequencePlayback) return;
-      if (setCommandTimer !== null) {
-        clearTimeout(setCommandTimer);
-        setCommandTimer = null;
-      }
-      pendingSetCommand = false;
-      sequencePlayback = {
-        points: sequencePoints.map(point => ({ ...point })),
-        direction,
-        segmentIndex: 0,
-        segmentStarted: false
-      };
-      renderRobotModel();
-      sendSequenceSegment();
-    }
-
-    function handleMessage(data) {
       if (data.type === "state") {
         displayNumber("xValue", data.x);
         displayNumber("yValue", data.y);
@@ -835,44 +770,35 @@
           }
         }
         const wasRunning = trajectoryRunning;
-        const nextTrajectoryRunning =
-          data.trajectory === true || data.preparing === true;
-        let sequenceFinished = false;
-        trajectoryRunning = nextTrajectoryRunning;
-        if (sequencePlayback) {
-          if (nextTrajectoryRunning) {
-            sequencePlayback.segmentStarted = true;
-          } else if (wasRunning && sequencePlayback.segmentStarted) {
-            sequencePlayback.segmentIndex += 1;
-            if (sequencePlayback.segmentIndex >= sequencePlayback.points.length - 1) {
-              finishSequencePlayback(
-                `Đã chạy hết ${sequencePlayback.points.length} điểm theo hướng ${sequencePlayback.direction > 0 ? "thuận" : "ngược"}.`
-              );
-              sequenceFinished = true;
-            } else {
-              sendSequenceSegment();
-            }
-          }
-        }
-        if (trajectoryRunning || sequencePlayback) controlsDirty = false;
+        trajectoryRunning = data.trajectory === true || data.preparing === true || data.sequenceActive === true;
+        if (trajectoryRunning) controlsDirty = false;
         controls.forEach(control => {
-          control.disabled = !writer || trajectoryRunning || Boolean(sequencePlayback);
+          control.disabled = !writer || trajectoryRunning;
         });
         updateTrajectoryButtons();
+
         if (data.preparing === true) {
           const progress = Number.isFinite(data.cacheProgress)
             ? Math.min(100, Math.max(0, data.cacheProgress))
             : 0;
           document.querySelector("#trajectoryStatus").textContent =
-            `Đang tính IK và tạo cache đường đi: ${progress}%`;
-        } else if (data.trajectory === true && wasRunning && !sequencePlayback) {
+            `Đang tiền tính toán toàn bộ các đoạn trong chuỗi: ${progress}%`;
+          setStatus(`Đang nướng chuỗi IK: ${progress}%`, "idle");
+        } else if (data.sequenceActive === true) {
+          const totalSegs = Math.max(1, (data.sequenceCount || sequencePoints.length) - 1);
           document.querySelector("#trajectoryStatus").textContent =
-            "Đã tạo cache. Robot đang chạy theo đường thẳng.";
-        } else if (!trajectoryRunning && wasRunning && !sequencePlayback &&
-                   !sequenceFinished) {
+            `Robot đang phát chuỗi bước chạy liên tục (không khựng): đoạn ${data.sequenceSegment + 1}/${totalSegs}`;
+          setStatus(`Đang phát chuỗi bước chạy (đoạn ${data.sequenceSegment + 1}/${totalSegs})`, "ok");
+        } else if (data.trajectory === true) {
           document.querySelector("#trajectoryStatus").textContent =
-            "Quỹ đạo đã kết thúc.";
+            "Robot đang di chuyển tiếp cận vị trí đầu chuỗi (Seeking)...";
+          setStatus("Đang tiếp cận điểm xuất phát", "idle");
+        } else if (!trajectoryRunning && wasRunning) {
+          document.querySelector("#trajectoryStatus").textContent =
+            "Đã hoàn thành toàn bộ chuỗi chuyển động.";
+          setStatus("Đã hoàn thành chuỗi", "ok");
         }
+
         if (!controlsDirty) {
           if (Number.isFinite(data.s1)) servo1.value = String(data.s1);
           if (Number.isFinite(data.s2)) servo2.value = String(data.s2);
@@ -881,7 +807,6 @@
           renderRobotModel();
         }
       } else if (data.type === "ack" && !data.ok) {
-        sequencePlayback = null;
         trajectoryRunning = false;
         renderRobotModel();
         controls.forEach(control => {
@@ -890,7 +815,6 @@
         updateTrajectoryButtons();
         setStatus(data.error || "Robot từ chối lệnh", "error");
       } else if (data.type === "error") {
-        sequencePlayback = null;
         trajectoryRunning = false;
         renderRobotModel();
         controls.forEach(control => {
@@ -899,10 +823,6 @@
         updateTrajectoryButtons();
         setStatus(data.message || "Lỗi từ robot", "error");
       } else if (data.type === "ack" && data.ok) {
-        if (sequencePlayback) {
-          sequencePlayback.segmentStarted = true;
-          trajectoryRunning = true;
-        }
         if (data.preparing === true) {
           trajectoryRunning = true;
           controls.forEach(control => {
@@ -910,15 +830,15 @@
           });
           updateTrajectoryButtons();
           document.querySelector("#trajectoryStatus").textContent =
-            "Đang tính IK và chia nhỏ quỹ đạo thành các bước góc tối đa 0,45°...";
+            "Đang tính IK và chia nhỏ quỹ đạo thành các bước góc...";
           setStatus("Đang chuẩn bị cache quỹ đạo", "idle");
         } else if (Number.isFinite(data.segmentMs)) {
           trajectoryRunning = true;
           document.querySelector("#trajectoryStatus").textContent =
-            `Phát lại cache quỹ đạo. Thời lượng ước tính: ${(data.segmentMs / 1000).toFixed(2)} giây.`;
-          setStatus("Đã bắt đầu phát lại quỹ đạo", "ok");
+            `Bắt đầu phát lại quỹ đạo. Thời lượng: ${(data.segmentMs / 1000).toFixed(2)} giây.`;
+          setStatus("Đã bắt đầu chạy", "ok");
         } else {
-          setStatus("Đã gửi lệnh", "ok");
+          setStatus("Đã thực hiện lệnh", "ok");
         }
       }
     }
@@ -965,6 +885,23 @@
       if (view.getUint8(2) !== protocolVersion) return null;
       const payloadOffset = 4;
       const type = view.getUint8(3);
+      if (type === packetTypes.sequencePoint) {
+        const index = view.getUint8(payloadOffset);
+        const totalCount = view.getUint8(payloadOffset + 1);
+        const x = view.getFloat32(payloadOffset + 4, true);
+        const y = view.getFloat32(payloadOffset + 8, true);
+        const z = view.getFloat32(payloadOffset + 12, true);
+        const wrist = view.getFloat32(payloadOffset + 16, true);
+        const gripper = view.getFloat32(payloadOffset + 20, true);
+        return {
+          type: "sequencePoint",
+          index,
+          totalCount,
+          x, y, z,
+          wrist,
+          gripper
+        };
+      }
       if (type === packetTypes.state) {
         const flags = view.getUint8(payloadOffset + 20);
         return {
@@ -976,7 +913,10 @@
           z: view.getFloat32(payloadOffset + 16, true),
           trajectory: (flags & 1) !== 0,
           preparing: (flags & 2) !== 0,
-          cacheProgress: view.getUint8(payloadOffset + 21)
+          sequenceActive: (flags & 4) !== 0,
+          cacheProgress: view.getUint8(payloadOffset + 21),
+          sequenceCount: view.getUint8(payloadOffset + 22),
+          sequenceSegment: view.getUint8(payloadOffset + 23)
         };
       }
       if (type === packetTypes.ack) {
@@ -1074,6 +1014,7 @@
         updateTrajectoryButtons();
         readLoop();
         await sendCommand(commandTypes.getState);
+        await sendCommand(commandTypes.getPoints);
       } catch (error) {
         port = null;
         writer = null;
@@ -1084,7 +1025,6 @@
     async function disconnect() {
       const activePort = port;
       port = null;
-      sequencePlayback = null;
       trajectoryRunning = false;
       receiveBuffer = new Uint8Array(0);
       if (setCommandTimer !== null) {
@@ -1132,8 +1072,11 @@
       const firstAngle = Number(servo1.value);
       const secondAngle = Number(servo2.value);
       const targetAngle = Number(stepAngle.value);
+      const wristAngle = Number(wrist.value);
+      const gripperAngle = Number(gripper.value);
       if (!Number.isFinite(firstAngle) || !Number.isFinite(secondAngle) ||
-          !Number.isFinite(targetAngle)) {
+          !Number.isFinite(targetAngle) || !Number.isFinite(wristAngle) ||
+          !Number.isFinite(gripperAngle)) {
         pendingSetCommand = false;
         setStatus("Góc điều khiển không hợp lệ", "error");
         return;
@@ -1143,7 +1086,7 @@
       lastSetCommandAt = performance.now();
       try {
         await sendCommand(commandTypes.setJoints, [
-          firstAngle, secondAngle, targetAngle
+          firstAngle, secondAngle, targetAngle, wristAngle, gripperAngle
         ]);
         setStatus("Đang gửi góc...", "idle");
       } catch (error) {
@@ -1201,7 +1144,7 @@
     window.addEventListener("resize", renderRobotModel);
 
     document.addEventListener("keydown", event => {
-      if (!writer || trajectoryRunning || sequencePlayback || event.altKey || event.ctrlKey ||
+      if (!writer || trajectoryRunning || event.altKey || event.ctrlKey ||
           event.metaKey) {
         return;
       }
@@ -1220,7 +1163,11 @@
         a: [servo2, 1],
         s: [servo2, -1],
         z: [stepAngle, 0.9],
-        x: [stepAngle, -0.9]
+        x: [stepAngle, -0.9],
+        e: [wrist, -1],
+        r: [wrist, 1],
+        d: [gripper, -1],
+        f: [gripper, 1]
       };
       const binding = keyBindings[key];
       if (!binding) return;
@@ -1235,7 +1182,6 @@
     });
 
     stopButton.addEventListener("click", async () => {
-      sequencePlayback = null;
       if (setCommandTimer !== null) {
         clearTimeout(setCommandTimer);
         setCommandTimer = null;
@@ -1250,16 +1196,13 @@
       }
     });
 
-    saveSequencePointButton.addEventListener("click", saveCurrentSequencePoint);
-    resetSequenceButton.addEventListener("click", resetSequencePoints);
-    playForwardButton.addEventListener("click", () => startSequencePlayback(1));
-    playReverseButton.addEventListener("click", () => startSequencePlayback(-1));
+    saveSequencePointButton.addEventListener("click", saveCurrentPoint);
+    resetSequenceButton.addEventListener("click", resetPoints);
+    playForwardButton.addEventListener("click", () => playSequence());
 
     Object.keys(modelDimensions).forEach(name => {
       modelDimensionLabels[name].textContent = name;
     });
-    updateLabels();
-    loadSequencePoints();
     updateLabels();
     updateTrajectoryButtons();
   </script>

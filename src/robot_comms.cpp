@@ -1,5 +1,6 @@
 #include "robot_comms.h"
 #include <Arduino.h>
+#include <Preferences.h>
 #include <math.h>
 #include <string.h>
 #include "PWM.h"
@@ -19,11 +20,18 @@ constexpr uint8_t packetVersion = 1;
 constexpr uint8_t packetState = 1;
 constexpr uint8_t packetAck = 2;
 constexpr uint8_t packetError = 3;
+constexpr uint8_t packetSequencePoint = 4;
 constexpr uint8_t commandGetState = 16;
 constexpr uint8_t commandSetJoints = 17;
 constexpr uint8_t commandPlayTrajectory = 18;
 constexpr uint8_t commandStop = 19;
+constexpr uint8_t commandSavePoint = 20;
+constexpr uint8_t commandClearPoints = 21;
+constexpr uint8_t commandPlaySequence = 22;
+constexpr uint8_t commandGetPoints = 23;
 constexpr uint8_t ackDetailPreparing = 1;
+
+constexpr uint8_t MAX_SEQUENCE_POINTS = 8;
 
 enum CommunicationError : uint8_t {
   errorNone = 0,
@@ -45,7 +53,10 @@ enum CommunicationError : uint8_t {
   errorUnknownCommand = 16,
   errorJointCommandNotFinite = 17,
   errorStepperStall = 18,
-  errorTrajectoryCacheFull = 19
+  errorTrajectoryCacheFull = 19,
+  errorSequenceFull = 20,
+  errorSequenceEmpty = 21,
+  errorSequenceBusy = 22
 };
 
 #pragma pack(push, 1)
@@ -68,7 +79,69 @@ struct CartesianPoint {
   float z;
 };
 
-enum class Mode : uint8_t { Idle, Building, Seeking, Playing, Settling };
+struct StoredPoint {
+  float x;
+  float y;
+  float z;
+  float wrist;
+  float gripper;
+};
+
+// ---- Chuỗi điểm trong Flash ----
+Preferences preferences;
+StoredPoint sequencePoints[MAX_SEQUENCE_POINTS] = {};
+uint8_t sequenceCount = 0;
+bool sequenceActive = false;
+int8_t sequenceDirection = 1;
+uint8_t sequenceSegmentIndex = 0;
+
+// ---- Mảng lưu bước chạy cuối cùng (Baked Segments) ----
+constexpr uint8_t MAX_WAYPOINTS = 8;
+constexpr uint8_t MAX_SEGMENTS = MAX_WAYPOINTS - 1; // 7 đoạn
+constexpr uint16_t MAX_STEPS_PER_SEGMENT = 800;
+
+struct SegmentCache {
+  Joint steps[MAX_STEPS_PER_SEGMENT];
+  uint16_t count = 0;
+};
+
+SegmentCache bakedSegments[MAX_SEGMENTS];
+uint8_t bakedSegmentCount = 0;
+bool isSequenceBaked = false;
+
+// Trạng thái phát lại chuỗi
+bool activeSeqPlayback = false;
+int8_t activeSegIndex = 0;
+int16_t activeStepIndex = 0;
+
+enum class PlaySubState : uint8_t {
+  MovingArm,
+  SettleWrist,
+  SettleGripper
+};
+
+PlaySubState playSubState = PlaySubState::MovingArm;
+uint16_t settleTimerTicks = 0;
+float wristLerpFrom = 90.0f;
+float wristLerpTo = 90.0f;
+uint16_t wristTotalTicks = 1;
+
+// Trạng thái tính toán bake chuỗi
+uint8_t bakeSegIndex = 0;
+uint16_t bakePointIndex = 0;
+uint16_t bakePointCount = 0;
+CartesianPoint bakeFrom = {0, 0, 0};
+CartesianPoint bakeTo = {0, 0, 0};
+
+enum class Mode : uint8_t {
+  Idle,
+  Building,
+  BakingSequence,
+  Seeking,
+  Playing,
+  PlayingSequence,
+  Settling
+};
 
 uint8_t receiveBuffer[sizeof(CommunicationPacket) * 4];
 size_t receiveLength = 0;
@@ -171,6 +244,13 @@ uint8_t errorCodeForMessage(const char *message) {
     return errorJointCommandNotFinite;
   if (strcmp(message, "stepper lost steps or is stalled") == 0)
     return errorStepperStall;
+  if (strcmp(message, "sequence is full (maximum 8 points)") == 0)
+    return errorSequenceFull;
+  if (strcmp(message, "sequence requires at least 2 points to play") == 0)
+    return errorSequenceEmpty;
+  if (strcmp(message, "cannot save point while motion is active") == 0 ||
+      strcmp(message, "cannot clear sequence while motion is active") == 0)
+    return errorSequenceBusy;
   return errorCommandInvalid;
 }
 
@@ -239,6 +319,27 @@ bool sameCartesianPoint(const CartesianPoint &l, const CartesianPoint &r) {
 }
 
 // ---- Gửi dữ liệu ----
+void sendAllSequencePoints() {
+  if (sequenceCount == 0) {
+    uint8_t payload[24] = {};
+    payload[0] = 0;
+    payload[1] = 0;
+    writePacket(packetSequencePoint, payload, sizeof(payload));
+    return;
+  }
+  for (uint8_t i = 0; i < sequenceCount; ++i) {
+    uint8_t payload[24] = {};
+    payload[0] = i;
+    payload[1] = sequenceCount;
+    memcpy(&payload[4], &sequencePoints[i].x, sizeof(float));
+    memcpy(&payload[8], &sequencePoints[i].y, sizeof(float));
+    memcpy(&payload[12], &sequencePoints[i].z, sizeof(float));
+    memcpy(&payload[16], &sequencePoints[i].wrist, sizeof(float));
+    memcpy(&payload[20], &sequencePoints[i].gripper, sizeof(float));
+    writePacket(packetSequencePoint, payload, sizeof(payload));
+  }
+}
+
 void sendPreparingAck() {
   uint8_t payload[24] = {};
   payload[0] = 1;
@@ -258,14 +359,27 @@ void sendState(const RobotControlState &state) {
   memcpy(&payload[8], &x, sizeof(float));
   memcpy(&payload[12], &y, sizeof(float));
   memcpy(&payload[16], &z, sizeof(float));
-  payload[20] = (state.trajectoryActive ? 1 : 0) | (state.trajectoryPreparing ? 2 : 0);
+  payload[20] = (state.trajectoryActive ? 1 : 0) |
+                (state.trajectoryPreparing ? 2 : 0) |
+                (activeSeqPlayback ? 4 : 0);
   uint8_t progress = 0;
-  if (mode == Mode::Building && buildCount > 0) {
+  if (mode == Mode::BakingSequence && sequenceCount > 1) {
+    uint32_t totalSegs = sequenceCount - 1;
+    uint32_t segPercent = (uint32_t)bakeSegIndex * 100UL;
+    if (bakePointCount > 0) {
+      segPercent += (uint32_t)bakePointIndex * 100UL / bakePointCount;
+    }
+    progress = (uint8_t)(segPercent / totalSegs);
+  } else if (mode == Mode::Building && buildCount > 0) {
     progress = (uint8_t)((uint32_t)buildIndex * 100UL / buildCount);
-  } else if (cacheValid) {
+  } else if (mode == Mode::PlayingSequence && bakedSegmentCount > 0) {
+    progress = (uint8_t)((uint32_t)activeSegIndex * 100UL / bakedSegmentCount);
+  } else if (isSequenceBaked) {
     progress = 100;
   }
   payload[21] = progress;
+  payload[22] = sequenceCount;
+  payload[23] = (uint8_t)activeSegIndex;
   writePacket(packetState, payload, sizeof(payload));
 }
 
@@ -285,9 +399,13 @@ float readPacketFloat(const CommunicationPacket &packet, size_t offset) {
 
 // ---- Điều khiển chuyển động ----
 void haltMotion(RobotControlState &state) {
-  if (mode == Mode::Building) cacheValid = false;
+  if (mode == Mode::Building || mode == Mode::BakingSequence) cacheValid = false;
   mode = Mode::Idle;
   manualActive = false;
+  sequenceActive = false;
+  activeSeqPlayback = false;
+  playSubState = PlaySubState::MovingArm;
+  settleTimerTicks = 0;
   state.trajectoryActive = false;
   state.trajectoryPreparing = false;
   state.feedbackActive = false;
@@ -323,9 +441,261 @@ uint32_t plannedDurationMs() {
   return (uint32_t)((seekProfile.T + path.duration()) * 1000.0f);
 }
 
+bool launchTrajectory(const CartesianPoint &pointA, const CartesianPoint &pointB,
+                      RobotControlState &state, const char **errMsg) {
+  if (!state.stepperReady || !isfinite(state.measuredStepAngle)) {
+    if (errMsg) *errMsg = "stepper position is not ready";
+    return false;
+  }
+  Joint targetA;
+  if (!solvePoint(pointA, targetA)) {
+    if (errMsg) *errMsg = "point A is unreachable or violates joint limits";
+    return false;
+  }
+  const Joint current = commandedJoint(state);
+  if (!validJoint(current) || !validateJointSegment(current, targetA)) {
+    if (errMsg) *errMsg = "joint move to point A crosses a forbidden angle";
+    return false;
+  }
+
+  manualActive = false;
+  requestedPointA = pointA;
+  requestedPointB = pointB;
+
+  const bool forwardHit = cacheValid && sameCartesianPoint(pointA, cachedPointA) &&
+                          sameCartesianPoint(pointB, cachedPointB);
+  const bool reverseHit = cacheValid && sameCartesianPoint(pointA, cachedPointB) &&
+                          sameCartesianPoint(pointB, cachedPointA);
+  if (forwardHit || reverseHit) {
+    playReverse = reverseHit;
+    const Joint start = playReverse ? path.last() : path.first();
+    if (!validateJointSegment(current, start)) {
+      if (errMsg) *errMsg = "joint move to point A crosses a forbidden angle";
+      return false;
+    }
+    beginSeek(state, current, start);
+    return true;
+  }
+
+  const float dx = pointB.x - pointA.x, dy = pointB.y - pointA.y, dz = pointB.z - pointA.z;
+  const float len = sqrtf(dx * dx + dy * dy + dz * dz);
+  float n = ceilf(len / PATH_SAMPLE_MM) + 1.0f;
+  if (n < 2.0f) n = 2.0f;
+  if (n > (float)Trajectory::kMaxInputPoints) {
+    n = (float)Trajectory::kMaxInputPoints;
+  }
+  buildCount = (uint16_t)n;
+  buildIndex = 0;
+  playReverse = false;
+  path.clear();
+  cacheValid = false;
+  mode = Mode::Building;
+  state.trajectoryActive = false;
+  state.trajectoryPreparing = true;
+  state.feedbackActive = false;
+  return true;
+}
+
+void startPlaybackAfterBaked(int8_t direction, RobotControlState &state) {
+  if (bakedSegmentCount == 0) return;
+  sequenceDirection = 1; // Chỉ chạy xuôi
+  sequenceActive = true;
+  activeSegIndex = 0;
+  activeStepIndex = 0;
+
+  Joint targetStart = bakedSegments[0].steps[0];
+  state.wristAngle = sequencePoints[0].wrist;
+  state.gripperAngle = sequencePoints[0].gripper;
+  playSubState = PlaySubState::MovingArm;
+
+  const Joint current = commandedJoint(state);
+  const float diff = fmaxf(fabsf(targetStart.s1 - current.s1),
+                     fmaxf(fabsf(targetStart.s2 - current.s2),
+                           fabsf(targetStart.st - current.st)));
+
+  manualActive = false;
+  activeSeqPlayback = true;
+
+  if (diff > 0.5f) {
+    if (!validateJointSegment(current, targetStart)) {
+      failMotion(state, "joint move to sequence start crosses a forbidden angle");
+      return;
+    }
+    beginSeek(state, current, targetStart);
+  } else {
+    mode = Mode::PlayingSequence;
+    motionTimeS = 0.0f;
+    state.trajectoryPreparing = false;
+    state.trajectoryActive = true;
+    state.feedbackActive = true;
+    trimBudget = STEPPER_TRIM_BUDGET_STEPS;
+    stallWindowTicks = 0;
+    noProgressWindows = 0;
+    stallWindowStartSteps = getStepperSteps();
+    stallWindowStartAngle = state.measuredStepAngle;
+    movingTrimTicks = 0;
+  }
+  runPwm(state.servo1Angle, state.servo2Angle, state.wristAngle, state.gripperAngle);
+}
+
+bool initBakeSegment(uint8_t segIdx, RobotControlState &state) {
+  if (segIdx >= sequenceCount - 1) return false;
+  bakeSegIndex = segIdx;
+  bakeFrom = { sequencePoints[segIdx].x, sequencePoints[segIdx].y, sequencePoints[segIdx].z };
+  bakeTo = { sequencePoints[segIdx + 1].x, sequencePoints[segIdx + 1].y, sequencePoints[segIdx + 1].z };
+
+  Joint targetA, targetB;
+  if (!solvePoint(bakeFrom, targetA) || !solvePoint(bakeTo, targetB)) {
+    failMotion(state, "trajectory contains an unreachable or forbidden point");
+    return false;
+  }
+  const float dx = bakeTo.x - bakeFrom.x;
+  const float dy = bakeTo.y - bakeFrom.y;
+  const float dz = bakeTo.z - bakeFrom.z;
+  const float len = sqrtf(dx * dx + dy * dy + dz * dz);
+  float n = ceilf(len / PATH_SAMPLE_MM) + 1.0f;
+  if (n < 2.0f) n = 2.0f;
+  if (n > (float)Trajectory::kMaxInputPoints) n = (float)Trajectory::kMaxInputPoints;
+  bakePointCount = (uint16_t)n;
+  bakePointIndex = 0;
+  path.clear();
+  return true;
+}
+
+void bakeStep(RobotControlState &state) {
+  const float t = (float)bakePointIndex / (float)(bakePointCount - 1);
+  const CartesianPoint p = lerpPoint(bakeFrom, bakeTo, t);
+  Joint j;
+  if (!solvePoint(p, j)) {
+    failMotion(state, "trajectory contains an unreachable or forbidden point");
+    return;
+  }
+  if (!path.append(j)) {
+    failMotion(state, "trajectory cache capacity exceeded");
+    return;
+  }
+  ++bakePointIndex;
+  if (bakePointIndex < bakePointCount) return;
+
+  if (!path.finalize(speedLimits(), MOTION_ACCEL_TIME_S)) {
+    failMotion(state, "trajectory contains an unreachable or forbidden point");
+    return;
+  }
+
+  const float duration = path.duration();
+  uint16_t totalSteps = (uint16_t)ceilf(duration / loopDtS);
+  if (totalSteps < 1) totalSteps = 1;
+  if (totalSteps > MAX_STEPS_PER_SEGMENT) totalSteps = MAX_STEPS_PER_SEGMENT;
+
+  for (uint16_t s = 0; s < totalSteps; ++s) {
+    const float timeS = (float)s * loopDtS;
+    bakedSegments[bakeSegIndex].steps[s] = path.sample(timeS, false);
+  }
+  bakedSegments[bakeSegIndex].steps[totalSteps - 1] = path.last();
+  bakedSegments[bakeSegIndex].count = totalSteps;
+
+  ++bakeSegIndex;
+  if (bakeSegIndex < sequenceCount - 1) {
+    initBakeSegment(bakeSegIndex, state);
+  } else {
+    bakedSegmentCount = sequenceCount - 1;
+    isSequenceBaked = true;
+    state.trajectoryPreparing = false;
+    startPlaybackAfterBaked(1, state);
+  }
+}
+
+void saveCurrentPointToFlash(const RobotControlState &state) {
+  if (sequenceCount >= MAX_SEQUENCE_POINTS) {
+    sendAck(false, "sequence is full (maximum 8 points)");
+    return;
+  }
+  if (!state.stepperReady || !isfinite(state.measuredStepAngle)) {
+    sendAck(false, "stepper position is not ready");
+    return;
+  }
+  if (mode != Mode::Idle || state.trajectoryActive || state.trajectoryPreparing || manualActive) {
+    sendAck(false, "cannot save point while motion is active");
+    return;
+  }
+  float x = NAN, y = NAN, z = NAN;
+  ForwardKinematics(state.servo1Angle, state.servo2Angle - state.servo1Angle,
+                    state.measuredStepAngle, &x, &y, &z);
+  if (!isfinite(x) || !isfinite(y) || !isfinite(z)) {
+    sendAck(false, "current position is not finite");
+    return;
+  }
+  sequencePoints[sequenceCount] = { x, y, z, state.wristAngle, state.gripperAngle };
+  sequenceCount++;
+  preferences.putBytes("pts", sequencePoints, sizeof(StoredPoint) * sequenceCount);
+  preferences.putUChar("count", sequenceCount);
+  isSequenceBaked = false;
+  bakedSegmentCount = 0;
+  sendAck(true);
+  sendAllSequencePoints();
+}
+
+void clearSequencePointsInFlash(const RobotControlState &state) {
+  if (sequenceActive || mode != Mode::Idle || state.trajectoryActive || state.trajectoryPreparing || manualActive) {
+    sendAck(false, "cannot clear sequence while motion is active");
+    return;
+  }
+  sequenceCount = 0;
+  preferences.putUChar("count", 0);
+  isSequenceBaked = false;
+  bakedSegmentCount = 0;
+  sendAck(true);
+  sendAllSequencePoints();
+}
+
 void processCommand(const CommunicationPacket &packet, RobotControlState &state) {
   if (packet.type == commandGetState) {
     sendState(state);
+    return;
+  }
+
+  if (packet.type == commandGetPoints) {
+    sendAllSequencePoints();
+    return;
+  }
+
+  if (packet.type == commandSavePoint) {
+    saveCurrentPointToFlash(state);
+    return;
+  }
+
+  if (packet.type == commandClearPoints) {
+    clearSequencePointsInFlash(state);
+    return;
+  }
+
+  if (packet.type == commandPlaySequence) {
+    if (mode != Mode::Idle || state.trajectoryActive || state.trajectoryPreparing || manualActive) {
+      sendAck(false, "trajectory is already running or preparing");
+      return;
+    }
+    if (sequenceCount < 2) {
+      sendAck(false, "sequence requires at least 2 points to play");
+      return;
+    }
+    sequenceDirection = 1; // Chỉ chạy xuôi theo chuỗi hành động
+
+    if (isSequenceBaked && bakedSegmentCount == sequenceCount - 1) {
+      startPlaybackAfterBaked(1, state);
+      sendAck(true);
+      return;
+    }
+
+    isSequenceBaked = false;
+    bakedSegmentCount = 0;
+    bakeSegIndex = 0;
+    if (!initBakeSegment(0, state)) {
+      sendAck(false, "point A is unreachable or violates joint limits");
+      return;
+    }
+    state.trajectoryPreparing = true;
+    mode = Mode::BakingSequence;
+    sendPreparingAck();
     return;
   }
 
@@ -339,64 +709,21 @@ void processCommand(const CommunicationPacket &packet, RobotControlState &state)
       sendAck(false, "trajectory point is not finite");
       return;
     }
-    if (mode != Mode::Idle || state.trajectoryActive || state.trajectoryPreparing) {
+    if (mode != Mode::Idle || state.trajectoryActive || state.trajectoryPreparing || manualActive) {
       sendAck(false, "trajectory is already running or preparing");
       return;
     }
-    if (!state.stepperReady || !isfinite(state.measuredStepAngle)) {
-      sendAck(false, "stepper position is not ready");
+    sequenceActive = false;
+    const char *errMsg = nullptr;
+    if (!launchTrajectory(pointA, pointB, state, &errMsg)) {
+      sendAck(false, errMsg ? errMsg : "point A is unreachable or violates joint limits");
       return;
     }
-    Joint targetA;
-    if (!solvePoint(pointA, targetA)) {
-      sendAck(false, "point A is unreachable or violates joint limits");
-      return;
-    }
-    const Joint current = commandedJoint(state);
-    if (!validJoint(current) || !validateJointSegment(current, targetA)) {
-      sendAck(false, "joint move to point A crosses a forbidden angle");
-      return;
-    }
-
-    manualActive = false;
-    requestedPointA = pointA;
-    requestedPointB = pointB;
-
-    // Đã có cache: A->B chạy xuôi, B->A chạy ngược chính cache đó (không dựng lại).
-    const bool forwardHit = cacheValid && sameCartesianPoint(pointA, cachedPointA) &&
-                            sameCartesianPoint(pointB, cachedPointB);
-    const bool reverseHit = cacheValid && sameCartesianPoint(pointA, cachedPointB) &&
-                            sameCartesianPoint(pointB, cachedPointA);
-    if (forwardHit || reverseHit) {
-      playReverse = reverseHit;
-      const Joint start = playReverse ? path.last() : path.first();
-      if (!validateJointSegment(current, start)) {
-        sendAck(false, "joint move to point A crosses a forbidden angle");
-        return;
-      }
-      beginSeek(state, current, start);
+    if (mode == Mode::Seeking) {
       sendAck(true, nullptr, plannedDurationMs());
-      return;
+    } else {
+      sendPreparingAck();
     }
-
-    // Chưa có cache: dựng từng điểm, mỗi tick 1 lần IK.
-    const float dx = pointB.x - pointA.x, dy = pointB.y - pointA.y, dz = pointB.z - pointA.z;
-    const float len = sqrtf(dx * dx + dy * dy + dz * dz);
-    float n = ceilf(len / PATH_SAMPLE_MM) + 1.0f;
-    if (n < 2.0f) n = 2.0f;
-    if (n > (float)Trajectory::kMaxInputPoints) {
-      n = (float)Trajectory::kMaxInputPoints;
-    }
-    buildCount = (uint16_t)n;
-    buildIndex = 0;
-    playReverse = false;
-    path.clear();
-    cacheValid = false;
-    mode = Mode::Building;
-    state.trajectoryActive = false;
-    state.trajectoryPreparing = true;
-    state.feedbackActive = false;
-    sendPreparingAck();
     return;
   }
 
@@ -433,6 +760,27 @@ void processCommand(const CommunicationPacket &packet, RobotControlState &state)
   if (!state.stepperReady) {
     sendAck(false, "stepper feedback is not ready");
     return;
+  }
+
+  const float wristReq = readPacketFloat(packet, 12);
+  const float gripReq = readPacketFloat(packet, 16);
+  bool auxChanged = false;
+  if (isfinite(wristReq)) {
+    const float clampedWrist = fminf(WRIST_MAX_DEG, fmaxf(WRIST_MIN_DEG, wristReq));
+    if (state.wristAngle != clampedWrist) {
+      state.wristAngle = clampedWrist;
+      auxChanged = true;
+    }
+  }
+  if (isfinite(gripReq)) {
+    const float clampedGrip = fminf(GRIPPER_MAX_DEG, fmaxf(GRIPPER_MIN_DEG, gripReq));
+    if (state.gripperAngle != clampedGrip) {
+      state.gripperAngle = clampedGrip;
+      auxChanged = true;
+    }
+  }
+  if (auxChanged) {
+    runPwm(state.servo1Angle, state.servo2Angle, state.wristAngle, state.gripperAngle);
   }
 
   if (!manualActive) {
@@ -534,22 +882,35 @@ void applyCommand(RobotControlState &state, const Joint &cmd) {
   state.servo1Angle = cmd.s1;
   state.servo2Angle = cmd.s2;
   state.stepTargetAngle = cmd.st;
-  if (servoChanged) runPwm(cmd.s1, cmd.s2, 0.0f, 0.0f);
+  if (servoChanged) runPwm(cmd.s1, cmd.s2, state.wristAngle, state.gripperAngle);
 }
 
 bool motionActive() {
-  return (mode != Mode::Idle && mode != Mode::Building) || manualActive;
+  return (mode != Mode::Idle && mode != Mode::Building && mode != Mode::BakingSequence) || manualActive;
 }
 
 void finishTrajectory(RobotControlState &state) {
   mode = Mode::Idle;
   state.trajectoryActive = false;
   state.feedbackActive = false;
+  activeSeqPlayback = false;
+  sequenceActive = false;
+  playSubState = PlaySubState::MovingArm;
 }
 }  // namespace
 
 void robotCommsBegin() {
   Serial.begin(115200);
+  preferences.begin("arm_seq", false);
+  sequenceCount = preferences.getUChar("count", 0);
+  if (sequenceCount > MAX_SEQUENCE_POINTS) {
+    sequenceCount = 0;
+  }
+  if (sequenceCount > 0) {
+    preferences.getBytes("pts", sequencePoints, sizeof(StoredPoint) * sequenceCount);
+  }
+  isSequenceBaked = false;
+  bakedSegmentCount = 0;
   lastTelemetryMs = millis();
 }
 
@@ -572,6 +933,10 @@ void robotCommsRunTick(RobotControlState &state) {
       buildStep(state);
       break;
 
+    case Mode::BakingSequence:
+      bakeStep(state);
+      break;
+
     case Mode::Seeking: {
       motionTimeS += loopDtS;
       const float x = seekProfile.position(motionTimeS);
@@ -580,7 +945,119 @@ void robotCommsRunTick(RobotControlState &state) {
       if (motionTimeS >= seekProfile.T) {
         cmd = seekTo;
         motionTimeS = 0.0f;
-        mode = Mode::Playing;
+        if (activeSeqPlayback) {
+          mode = Mode::PlayingSequence;
+          playSubState = PlaySubState::MovingArm;
+          activeSegIndex = 0;
+          activeStepIndex = 0;
+          settleTimerTicks = 0;
+          state.trajectoryActive = true;
+          state.feedbackActive = true;
+          stallWindowTicks = 0;
+          noProgressWindows = 0;
+          stallWindowStartSteps = getStepperSteps();
+          stallWindowStartAngle = state.measuredStepAngle;
+          movingTrimTicks = 0;
+        } else {
+          mode = Mode::Playing;
+        }
+      }
+      break;
+    }
+
+    case Mode::PlayingSequence: {
+      if (activeSegIndex >= 0 && activeSegIndex < bakedSegmentCount) {
+        const SegmentCache &seg = bakedSegments[activeSegIndex];
+        const uint16_t lastStepIdx = seg.count > 0 ? seg.count - 1 : 0;
+
+        if (playSubState == PlaySubState::MovingArm) {
+          if (activeStepIndex < seg.count) {
+            cmd = seg.steps[activeStepIndex];
+            ++activeStepIndex;
+          }
+
+          if (activeStepIndex >= seg.count) {
+            const uint8_t targetPtIdx = activeSegIndex + 1;
+            const float targetWrist = sequencePoints[targetPtIdx].wrist;
+            const float targetGripper = sequencePoints[targetPtIdx].gripper;
+
+            const bool wristDiffers = fabsf(targetWrist - state.wristAngle) > 0.1f;
+            const bool gripperDiffers = fabsf(targetGripper - state.gripperAngle) > 0.1f;
+
+            if (wristDiffers) {
+              wristLerpFrom = state.wristAngle;
+              wristLerpTo = targetWrist;
+              playSubState = PlaySubState::SettleWrist;
+              settleTimerTicks = (uint16_t)(WRIST_SETTLE_MS / (loopDtS * 1000.0f));
+              if (settleTimerTicks < 1) settleTimerTicks = 1;
+              wristTotalTicks = settleTimerTicks;
+            } else if (gripperDiffers) {
+              state.gripperAngle = targetGripper;
+              runPwm(state.servo1Angle, state.servo2Angle, state.wristAngle, state.gripperAngle);
+              playSubState = PlaySubState::SettleGripper;
+              settleTimerTicks = (uint16_t)(GRIPPER_SETTLE_MS / (loopDtS * 1000.0f));
+            } else {
+              ++activeSegIndex;
+              activeStepIndex = 0;
+              if (activeSegIndex >= bakedSegmentCount) {
+                settleTicks = 0;
+                mode = Mode::Settling;
+              } else {
+                playSubState = PlaySubState::MovingArm;
+              }
+            }
+          }
+        } else if (playSubState == PlaySubState::SettleWrist) {
+          cmd = seg.steps[lastStepIdx];
+          if (settleTimerTicks > 0) {
+            --settleTimerTicks;
+            const float t = 1.0f - ((float)settleTimerTicks / (float)wristTotalTicks);
+            const float s = t * t * (3.0f - 2.0f * t);
+            state.wristAngle = wristLerpFrom + (wristLerpTo - wristLerpFrom) * s;
+            runPwm(state.servo1Angle, state.servo2Angle, state.wristAngle, state.gripperAngle);
+          }
+          if (settleTimerTicks == 0) {
+            state.wristAngle = wristLerpTo;
+            runPwm(state.servo1Angle, state.servo2Angle, state.wristAngle, state.gripperAngle);
+            const uint8_t targetPtIdx = activeSegIndex + 1;
+            const float targetGripper = sequencePoints[targetPtIdx].gripper;
+            const bool gripperDiffers = fabsf(targetGripper - state.gripperAngle) > 0.1f;
+
+            if (gripperDiffers) {
+              state.gripperAngle = targetGripper;
+              runPwm(state.servo1Angle, state.servo2Angle, state.wristAngle, state.gripperAngle);
+              playSubState = PlaySubState::SettleGripper;
+              settleTimerTicks = (uint16_t)(GRIPPER_SETTLE_MS / (loopDtS * 1000.0f));
+            } else {
+              ++activeSegIndex;
+              activeStepIndex = 0;
+              if (activeSegIndex >= bakedSegmentCount) {
+                settleTicks = 0;
+                mode = Mode::Settling;
+              } else {
+                playSubState = PlaySubState::MovingArm;
+              }
+            }
+          }
+        } else if (playSubState == PlaySubState::SettleGripper) {
+          cmd = seg.steps[lastStepIdx];
+          if (settleTimerTicks > 0) {
+            --settleTimerTicks;
+          }
+          if (settleTimerTicks == 0) {
+            ++activeSegIndex;
+            activeStepIndex = 0;
+            if (activeSegIndex >= bakedSegmentCount) {
+              settleTicks = 0;
+              mode = Mode::Settling;
+            } else {
+              playSubState = PlaySubState::MovingArm;
+            }
+          }
+        }
+      } else {
+        settleTicks = 0;
+        mode = Mode::Settling;
       }
       break;
     }
@@ -629,7 +1106,7 @@ void robotCommsFeedback(RobotControlState &state, float measuredAngleDeg) {
       state.measuredStepAngle = NAN;
       if (motionActive()) {
         failMotion(state, "AS5600 feedback lost or outside step limits");
-      } else if (mode == Mode::Building) {
+      } else if (mode == Mode::Building || mode == Mode::BakingSequence) {
         failMotion(state, "AS5600 feedback lost while preparing trajectory");
       }
     }
@@ -709,10 +1186,8 @@ void robotCommsFeedback(RobotControlState &state, float measuredAngleDeg) {
 
   if (mode == Mode::Settling) {
     ++settleTicks;
-    if (absErr <= STEPPER_SETTLE_DEADBAND_DEG) {
-      finishTrajectory(state);
-    } else if (settleTicks >= STEPPER_SETTLE_TIMEOUT_TICKS) {
-      if (absErr > STEPPER_STALL_ERROR_DEG) {
+    if (absErr <= STEPPER_SETTLE_DEADBAND_DEG || settleTicks >= STEPPER_SETTLE_TIMEOUT_TICKS) {
+      if (absErr > STEPPER_STALL_ERROR_DEG && settleTicks >= STEPPER_SETTLE_TIMEOUT_TICKS) {
         failMotion(state, "stepper lost steps or is stalled");
       } else {
         finishTrajectory(state);
